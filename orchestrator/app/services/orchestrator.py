@@ -173,9 +173,10 @@ class Orchestrator:
                 )
                 logger.info(f"[进度更新] {stage_text}")
             
+            max_videos = int(getattr(settings, "MAX_VIDEOS_PER_BLOGGER", 0) or 0)
             videos_info = await self.douyin.get_user_videos(
                 user_url,
-                max_videos=0,
+                max_videos=max_videos,
                 known_sec_user_id=blogger.sec_user_id or "",
                 progress_callback=on_crawl_progress
             )

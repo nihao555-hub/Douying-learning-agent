@@ -242,6 +242,10 @@ class DouyinClient:
     async def get_sec_user_id_from_video_page(self, url: str) -> Optional[str]:
         """从视频网页提取作者的sec_user_id"""
         try:
+            detail = await self._get_video_from_share_page(await self.get_aweme_id(url) or "")
+            if detail and detail.get("author", {}).get("sec_user_id"):
+                return detail["author"]["sec_user_id"]
+            
             url = await self.resolve_share_url(url)
             cookies = await self._ensure_base_cookies()
             
@@ -258,33 +262,118 @@ class DouyinClient:
                 
                 html = resp.text
                 
-                # 方法1: 从RENDER_DATA中提取
-                match = re.search(r'"secUid":"([^"]+)"', html)
-                if match:
-                    sec_uid = match.group(1)
-                    if sec_uid.startswith("MS4w"):
-                        logger.info(f"从视频页面提取到sec_user_id: {sec_uid[:30]}...")
-                        return sec_uid
+                match = re.search(r'"sec_uid"\s*:\s*"([^"]+)"', html) or re.search(r'"secUid":"([^"]+)"', html)
+                if match and match.group(1).startswith("MS4w"):
+                    return match.group(1)
                 
-                # 方法2: 从author信息中提取
-                match = re.search(r'"sec_user_id":"([^"]+)"', html)
-                if match:
-                    sec_uid = match.group(1)
-                    if sec_uid.startswith("MS4w"):
-                        logger.info(f"从视频页面提取到sec_user_id: {sec_uid[:30]}...")
-                        return sec_uid
-                
-                # 方法3: 从任何MS4w开头的字符串提取
                 match = re.search(r'(MS4wLjABAAAA[A-Za-z0-9_-]+)', html)
                 if match:
-                    sec_uid = match.group(1)
-                    logger.info(f"从视频页面提取到sec_user_id: {sec_uid[:30]}...")
-                    return sec_uid
-                
-                logger.debug("无法从视频页面提取sec_user_id")
+                    return match.group(1)
                 return None
         except Exception as e:
             logger.debug(f"从视频页面提取sec_user_id失败: {e}")
+            return None
+    
+    async def _get_video_from_share_page(self, aweme_id: str) -> Optional[Dict]:
+        """
+        通过 iesdouyin 分享页解析视频+作者信息。
+        机房 IP 上 F2/yt-dlp 常因无 cookie 失败，此路径不依赖登录态，稳定性更好。
+        """
+        if not aweme_id:
+            return None
+        try:
+            mobile_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://www.douyin.com/",
+            }
+            urls = [
+                f"https://www.iesdouyin.com/share/video/{aweme_id}",
+                f"https://www.iesdouyin.com/share/video/{aweme_id}/",
+            ]
+            async with httpx.AsyncClient(
+                headers=mobile_headers,
+                follow_redirects=True,
+                timeout=20,
+                verify=False,
+            ) as client:
+                html = ""
+                for u in urls:
+                    resp = await client.get(u)
+                    if resp.status_code == 200 and len(resp.text) > 1000:
+                        html = resp.text
+                        break
+                if not html:
+                    return None
+                
+                match = re.search(
+                    r"window\._ROUTER_DATA\s*=\s*(\{.*?\});?\s*</script>",
+                    html,
+                    re.S,
+                )
+                item = None
+                if match:
+                    try:
+                        router = json.loads(match.group(1))
+                        page = (router.get("loaderData") or {}).get("video_(id)/page") or {}
+                        item_list = (page.get("videoInfoRes") or {}).get("item_list") or []
+                        if item_list:
+                            item = item_list[0]
+                    except Exception as e:
+                        logger.debug(f"解析 _ROUTER_DATA 失败: {e}")
+                
+                if not item:
+                    # 弱解析兜底
+                    sec = re.search(r'"sec_uid"\s*:\s*"(MS4wLjABAAAA[^"]+)"', html)
+                    nick = re.search(r'"nickname"\s*:\s*"([^"]+)"', html)
+                    desc = re.search(r'"desc"\s*:\s*"([^"]*)"', html)
+                    if not sec:
+                        return None
+                    return {
+                        "aweme_id": str(aweme_id),
+                        "title": (desc.group(1) if desc else "无标题")[:500],
+                        "desc": desc.group(1) if desc else "",
+                        "cover_url": "",
+                        "duration": 0,
+                        "digg_count": 0,
+                        "comment_count": 0,
+                        "share_count": 0,
+                        "collect_count": 0,
+                        "play_count": 0,
+                        "create_time": None,
+                        "video_url": "",
+                        "webpage_url": f"https://www.douyin.com/video/{aweme_id}",
+                        "author": {
+                            "nickname": nick.group(1) if nick else f"用户_{aweme_id[-6:]}",
+                            "avatar_url": "",
+                            "sec_user_id": sec.group(1),
+                            "uid": "",
+                            "follower_count": 0,
+                            "following_count": 0,
+                            "aweme_count": 0,
+                            "total_favorited": 0,
+                            "signature": "",
+                        },
+                    }
+                
+                # 标准化分享页 item（结构接近 APP aweme）
+                video = self._normalize_app_video(item)
+                # 分享页常给有水印 playwm，尝试去水印
+                if "playwm" in (video.get("video_url") or ""):
+                    video["video_url"] = video["video_url"].replace("playwm", "play")
+                logger.info(
+                    f"分享页解析成功: {video.get('title', '')[:40]}... "
+                    f"作者={video.get('author', {}).get('nickname')} "
+                    f"作品数={video.get('author', {}).get('aweme_count')}"
+                )
+                return video
+        except Exception as e:
+            logger.warning(f"分享页解析失败 {aweme_id}: {e}")
             return None
     
     def _normalize_ytdlp_video(self, info: Dict, sec_user_id: str = None) -> Dict:
@@ -398,15 +487,31 @@ class DouyinClient:
                 author_info = None
                 aweme_id = await self.get_aweme_id(url)
                 
-                # 1a: 优先使用F2 PostDetail获取视频详情（含正确的sec_user_id）
+                # 1a: 分享页解析（不依赖登录 cookie，机房环境最稳）
                 if aweme_id:
-                    logger.info(f"检测到视频链接，使用F2获取视频和作者信息: {aweme_id}")
+                    logger.info(f"检测到视频链接，优先分享页解析: {aweme_id}")
+                    share_video = await self._get_video_from_share_page(aweme_id)
+                    if share_video:
+                        author_info = share_video["author"]
+                        logger.info(f"分享页获取作者: {author_info.get('nickname', '')}")
+                
+                # 1b: APP feed
+                if not author_info and aweme_id:
+                    logger.info(f"从 APP feed 查找: {aweme_id}")
+                    feed_video = await self._find_video_in_feed(aweme_id, max_pages=8)
+                    if feed_video:
+                        author_info = feed_video["author"]
+                        logger.info(f"APP feed 获取作者: {author_info.get('nickname', '')}")
+                
+                # 1c: F2 PostDetail
+                if not author_info and aweme_id:
+                    logger.info(f"使用F2获取视频和作者信息: {aweme_id}")
                     f2_detail = await self._get_post_detail_f2(aweme_id)
                     if f2_detail:
                         author_info = f2_detail["author"]
                         logger.info(f"F2获取作者: {author_info.get('nickname', '')}")
                 
-                # 1b: 如果F2失败，用yt-dlp获取作者昵称等信息
+                # 1d: yt-dlp
                 if not author_info:
                     logger.info("F2获取失败，尝试yt-dlp...")
                     info = await self._run_ytdlp(url, download=False)
@@ -415,18 +520,17 @@ class DouyinClient:
                         author_info = video_data["author"]
                         logger.info(f"yt-dlp获取作者: {author_info.get('nickname', '')}")
                         
-                        # 用aweme_id再试一次F2获取sec_user_id
                         if aweme_id and not author_info.get("sec_user_id", "").startswith("MS4w"):
                             f2_detail = await self._get_post_detail_f2(aweme_id)
                             if f2_detail and f2_detail["author"].get("sec_user_id", "").startswith("MS4w"):
                                 author_info["sec_user_id"] = f2_detail["author"]["sec_user_id"]
                                 logger.info(f"通过F2补充sec_user_id成功")
                 
-                # 1c: 如果都失败，尝试其他API
+                # 1e: 其他详情 API
                 if not author_info and aweme_id:
-                    feed_video = await self._get_video_detail(aweme_id)
-                    if feed_video:
-                        author_info = feed_video["author"]
+                    detail_video = await self._get_video_detail(aweme_id)
+                    if detail_video:
+                        author_info = detail_video["author"]
                 
                 if author_info:
                     # 如果有正确的sec_user_id，尝试用F2获取更完整的用户信息
@@ -728,9 +832,33 @@ class DouyinClient:
                 
                 aweme_id = await self.get_aweme_id(url)
                 
-                # 方法1: 优先使用F2 PostDetail获取视频详情（含正确的sec_user_id）
+                # 方法1: 分享页（不依赖登录 cookie）
                 initial_video = None
                 if aweme_id:
+                    _report_progress(0, "正在解析分享页视频详情...")
+                    share_video = await self._get_video_from_share_page(aweme_id)
+                    if share_video:
+                        initial_video = share_video
+                        author_sec_uid = share_video.get("author", {}).get("sec_user_id", "") or author_sec_uid
+                        author_uid = share_video.get("author", {}).get("uid", "")
+                        videos.append(share_video)
+                        _report_progress(1, f"已获取视频: {share_video['title'][:30]}...")
+                        logger.info(f"分享页获取视频成功: {share_video['title'][:40]}...")
+                
+                # 方法2: APP feed
+                if not initial_video and aweme_id:
+                    _report_progress(0, "正在从 APP feed 获取视频详情...")
+                    feed_video = await self._find_video_in_feed(aweme_id, max_pages=8)
+                    if feed_video:
+                        initial_video = feed_video
+                        author_sec_uid = feed_video.get("author", {}).get("sec_user_id", "") or author_sec_uid
+                        author_uid = feed_video.get("author", {}).get("uid", "")
+                        videos.append(feed_video)
+                        _report_progress(1, f"已获取视频: {feed_video['title'][:30]}...")
+                        logger.info(f"APP feed 获取视频成功: {feed_video['title'][:40]}...")
+                
+                # 方法3: F2 PostDetail
+                if not initial_video and aweme_id:
                     _report_progress(0, "正在获取视频详情...")
                     logger.info(f"使用F2获取视频详情: {aweme_id}")
                     f2_detail = await self._get_post_detail_f2(aweme_id)
@@ -742,7 +870,7 @@ class DouyinClient:
                         _report_progress(1, f"已获取视频: {f2_detail['title'][:30]}...")
                         logger.info(f"F2获取视频详情成功: {f2_detail['title'][:40]}...")
                 
-                # 方法2: 如果F2详情失败，用旧的详情API
+                # 方法3: 其他详情 API
                 if not initial_video and aweme_id:
                     logger.info(f"F2详情失败，尝试其他API: {aweme_id}")
                     detail_video = await self._get_video_detail(aweme_id)
@@ -754,7 +882,7 @@ class DouyinClient:
                         _report_progress(1, f"已获取视频: {detail_video['title'][:30]}...")
                         logger.info(f"视频详情获取成功: {detail_video['title'][:40]}...")
                 
-                # 方法3: 如果都失败，用yt-dlp获取
+                # 方法4: yt-dlp
                 if not initial_video:
                     info = await self._run_ytdlp(url, download=False)
                     if info:

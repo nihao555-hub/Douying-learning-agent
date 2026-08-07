@@ -36,9 +36,9 @@ class Settings(BaseSettings):
     # 数据库
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/orchestrator.db"
     
-    # Gemini API 配置
+    # Gemini API 配置（密钥仅服务端环境变量，禁止硬编码进仓库/前端）
     GEMINI_API_BASE_URL: str = "https://grsai.dakka.com.cn"
-    GEMINI_API_KEY: str = "sk-70f67a051b1848f094cf270410772c81"
+    GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-3.1-flash-lite"
     
     # 知识库配置
