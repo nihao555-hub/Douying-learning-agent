@@ -1,0 +1,30 @@
+# 数据文件
+orchestrator/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 环境配置
+.env
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 日志
+*.log
+logs/
+
+# 视频/音频文件
+*.mp4
+*.wav
+*.mp3
+
+# 系统
+.DS_Store
+Thumbs.db

@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # 1. Dify - 开源 LLM 应用开发平台 (130k+ stars)
+  # GitHub: https://github.com/langgenius/dify
+  # 提供知识库管理、RAG 引擎、对话应用、可视化界面
+  # ============================================
+  
+  # Dify 使用官方的 docker-compose 启动
+  # 这里只提供编排服务与 Dify 的网络连接
+  # Dify 请单独部署，参考: https://docs.dify.ai/getting-started/install-self-hosted/docker-compose
+
+  # ============================================
+  # 2. Douyin_TikTok_Download_API - 抖音爬虫 (15.5k+ stars)
+  # GitHub: https://github.com/Evil0ctal/Douyin_TikTok_Download_API
+  # 提供抖音视频解析、用户信息获取、视频下载等 API
+  # ============================================
+  douyin-api:
+    image: evil0ctal/douyin_tiktok_download_api:latest
+    container_name: douyin-learning-douyin-api
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - TZ=Asia/Shanghai
+      # 可选：配置抖音 Cookie（用于获取更多数据）
+      # - DOUYIN_COOKIE=your_cookie_here
+    volumes:
+      - ./data/douyin-api:/app/data
+    networks:
+      - douyin-learning
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================
+  # 3. 编排服务 - 我们自己写的胶水层
+  # 连接抖音爬虫 → 语音识别 → Dify 知识库
+  # ============================================
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: douyin-learning-orchestrator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Shanghai
+      # 抖音爬虫 API 地址（容器内访问）
+      - DOUYIN_API_BASE_URL=http://douyin-api:5000
+      # Dify API 地址（用户需要配置 Dify 后填写）
+      - DIFY_API_BASE_URL=http://host.docker.internal:8080
+      - DIFY_API_KEY=${DIFY_API_KEY:-}
+      - DIFY_DATASET_ID=${DIFY_DATASET_ID:-}
+      # 语音识别配置
+      - ASR_ENGINE=faster-whisper
+      - WHISPER_MODEL_SIZE=base
+      - WHISPER_LANGUAGE=zh
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+    volumes:
+      - ./data/videos:/app/data/videos
+      - ./data/audios:/app/data/audios
+      - ./data/transcripts:/app/data/transcripts
+      - ./data/orchestrator.db:/app/data/orchestrator.db
+      # 挂载模型缓存，避免重复下载
+      - ./data/models:/root/.cache/huggingface
+    networks:
+      - douyin-learning
+    depends_on:
+      - douyin-api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/system/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  douyin-learning:
+    driver: bridge
