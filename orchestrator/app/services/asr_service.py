@@ -1,12 +1,12 @@
 """
 语音识别服务
-优先使用 faster-whisper，返回带时间戳分段；不可用则降级。
+优先使用本地 faster-whisper 模型目录，返回带时间戳分段。
 """
 import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['HF_HUB_DISABLE_SSL_VERIFICATION'] = '1'
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from app.core.config import settings
 from app.core.logger import logger
 
@@ -23,15 +23,29 @@ class ASRService:
         self.available = False
         self._init_model()
     
+    def _resolve_model_path(self):
+        """优先本地模型目录，避免运行时访问 HuggingFace"""
+        local = getattr(settings, "WHISPER_MODEL_PATH", "") or ""
+        candidates = [
+            local,
+            "/workspace/orchestrator/data/models/faster-whisper-base",
+            "./data/models/faster-whisper-base",
+            str(Path(__file__).resolve().parents[2] / "data" / "models" / "faster-whisper-base"),
+        ]
+        for c in candidates:
+            if c and Path(c).exists() and (Path(c) / "model.bin").exists():
+                return c
+        return self.model_size
+    
     def _init_model(self):
-        """初始化faster-whisper模型"""
         try:
             from faster_whisper import WhisperModel
-            logger.info(f"正在加载 faster-whisper 模型: {self.model_size}")
+            model_id = self._resolve_model_path()
+            logger.info(f"正在加载 faster-whisper 模型: {model_id}")
             self.model = WhisperModel(
-                self.model_size,
+                model_id,
                 device=self.device,
-                compute_type=self.compute_type
+                compute_type=self.compute_type,
             )
             self.available = True
             logger.info("faster-whisper 模型加载成功")
@@ -41,15 +55,10 @@ class ASRService:
             self.available = False
     
     async def transcribe(self, audio_path: str) -> str:
-        """兼容旧接口：只返回纯文本"""
         result = await self.transcribe_with_timestamps(audio_path)
         return result.get("text", "")
     
     async def transcribe_with_timestamps(self, audio_path: str) -> Dict:
-        """
-        带时间戳转写
-        返回: {text, segments:[{start,end,text}], language}
-        """
         if not self.available or not self.model:
             logger.warning("ASR不可用，返回空文本（将使用视频描述）")
             return {"text": "", "segments": [], "language": self.language}
@@ -63,7 +72,8 @@ class ASRService:
                     audio_path,
                     language=self.language,
                     beam_size=5,
-                    vad_filter=True,
+                    # 关掉严格 VAD，尽量保留完整音频内容
+                    vad_filter=False,
                     word_timestamps=False,
                 )
                 segments = []

@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     WHISPER_LANGUAGE: str = "zh"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
+    # 本地 faster-whisper 模型目录（优先于在线下载）
+    WHISPER_MODEL_PATH: str = "./data/models/faster-whisper-base"
     
     # 存储路径
     VIDEO_STORAGE_PATH: str = "./data/videos"
@@ -50,10 +52,9 @@ class Settings(BaseSettings):
     # 视频处理总并发上限（下载+ASR+AI解析流水线）
     MAX_CONCURRENT_VIDEOS: int = 1000
     REQUEST_INTERVAL: int = 2
-    # 视频完整学习流水线
-    VIDEO_CHUNK_CHARS: int = 6000
-    VIDEO_MAX_FRAMES: int = 8
-    VIDEO_FRAME_INTERVAL: int = 8
+    # 视频完整学习流水线（切片，不抽帧）
+    VIDEO_CHUNK_CHARS: int = 8000
+    VIDEO_SLICE_SECONDS: int = 120
     MAX_VIDEOS_PER_BLOGGER: int = 0
     
     class Config:

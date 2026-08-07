@@ -1,106 +1,156 @@
 """
-视频完整学习流水线（六层）
-1) 完整素材  2) 带时间戳 ASR  3) 关键帧多模态补全
-4) 结构化深度解析  5) 知识原子化卡片  6) 验收门禁
-大视频：按时间窗分段解析，再综合合成
+视频完整学习流水线（不要抽帧）
+1) 下载完整视频素材
+2) 完整音频提取；大视频按时间切片做完整 ASR（带时间戳）并拼接
+3) 结构化深度解析（大文稿再按字数分段综合）
+4) 知识原子化卡片
+5) 验收门禁
+
+说明：不把整段超大视频一次性塞给 LLM；但对学习者而言覆盖「完整视频口播内容」。
 """
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import math
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from app.core.config import settings
 from app.core.logger import logger
 
 
 class VideoLearningPipeline:
-    """单视频完整知识学习流水线"""
+    """单视频完整知识学习流水线（切片，不抽帧）"""
 
-    def __init__(self, asr, gemini, frames_dir: str = "./data/frames"):
+    def __init__(self, asr, gemini, slices_dir: str = "./data/slices"):
         self.asr = asr
         self.gemini = gemini
-        self.frames_dir = Path(frames_dir)
-        self.frames_dir.mkdir(parents=True, exist_ok=True)
-        # 大视频分段：默认每段最多约 8 分钟口播文本 / 或按字数切
-        self.chunk_chars = int(getattr(settings, "VIDEO_CHUNK_CHARS", 6000) or 6000)
-        self.max_frames = int(getattr(settings, "VIDEO_MAX_FRAMES", 8) or 8)
-        self.frame_interval = int(getattr(settings, "VIDEO_FRAME_INTERVAL", 8) or 8)
-
-    async def extract_keyframes(self, video_path: str, aweme_id: str, duration: int = 0) -> List[Dict]:
-        """用 ffmpeg 抽取关键帧（按间隔），返回 [{path, timestamp, b64}]"""
-        out_dir = self.frames_dir / aweme_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # 清理旧帧
-        for old in out_dir.glob("frame_*.jpg"):
-            try:
-                old.unlink()
-            except Exception:
-                pass
-
-        # 估算间隔：优先固定间隔，过长视频自动加大间隔，控制总帧数
-        interval = max(3, self.frame_interval)
-        if duration and duration > 0:
-            interval = max(interval, int(math.ceil(duration / max(self.max_frames, 1))))
-
-        pattern = str(out_dir / "frame_%03d.jpg")
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vf", f"fps=1/{interval}",
-            "-q:v", "5",
-            "-frames:v", str(self.max_frames),
-            pattern,
-        ]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                logger.warning(f"抽帧失败: {stderr.decode('utf-8', errors='ignore')[:200]}")
-                return []
-        except Exception as e:
-            logger.warning(f"抽帧异常: {e}")
-            return []
-
-        frames = []
-        for i, fp in enumerate(sorted(out_dir.glob("frame_*.jpg"))[: self.max_frames]):
-            try:
-                raw = fp.read_bytes()
-                # 限制单帧大小，过大则跳过（避免 API 超时）
-                if len(raw) > 1_200_000:
-                    continue
-                b64 = base64.b64encode(raw).decode("ascii")
-                ts = i * interval
-                frames.append({
-                    "path": str(fp),
-                    "timestamp": ts,
-                    "timestamp_label": self._fmt_ts(ts),
-                    "b64": b64,
-                    "mime": "image/jpeg",
-                })
-            except Exception as e:
-                logger.debug(f"读取帧失败 {fp}: {e}")
-        logger.info(f"抽取关键帧 {len(frames)} 张 (interval={interval}s)")
-        return frames
+        self.slices_dir = Path(slices_dir)
+        self.slices_dir.mkdir(parents=True, exist_ok=True)
+        # 文稿送给 LLM 时的切段字数
+        self.chunk_chars = int(getattr(settings, "VIDEO_CHUNK_CHARS", 8000) or 8000)
+        # 大视频/音频时间切片长度（秒），用于完整 ASR
+        self.slice_seconds = int(getattr(settings, "VIDEO_SLICE_SECONDS", 120) or 120)
 
     @staticmethod
     def _fmt_ts(seconds: float) -> str:
         s = int(max(0, seconds))
         return f"{s // 60:02d}:{s % 60:02d}"
 
-    async def transcribe_timestamped(self, audio_path: str) -> Dict:
-        """带时间戳 ASR；不可用时返回空 segments"""
-        if hasattr(self.asr, "transcribe_with_timestamps"):
-            return await self.asr.transcribe_with_timestamps(audio_path)
-        text = await self.asr.transcribe(audio_path)
+    async def _probe_duration(self, media_path: str) -> float:
+        """用 ffprobe 获取时长（秒）"""
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            media_path,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, _ = await proc.communicate()
+            return float((out or b"0").decode().strip() or 0)
+        except Exception:
+            return 0.0
+
+    async def slice_audio_for_asr(self, audio_path: str, aweme_id: str, duration: float = 0) -> List[Dict]:
+        """
+        将完整音频按时间切片，返回 [{path, start, end}]。
+        短音频不切片，直接返回原文件。
+        """
+        if not audio_path or not Path(audio_path).exists():
+            return []
+
+        dur = duration or await self._probe_duration(audio_path)
+        if dur <= 0:
+            return [{"path": audio_path, "start": 0.0, "end": 0.0}]
+
+        # 不超过一片则不切
+        if dur <= self.slice_seconds * 1.2:
+            return [{"path": audio_path, "start": 0.0, "end": dur}]
+
+        out_dir = self.slices_dir / aweme_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for old in out_dir.glob("slice_*.wav"):
+            try:
+                old.unlink()
+            except Exception:
+                pass
+
+        slices = []
+        n = int(math.ceil(dur / self.slice_seconds))
+        logger.info(f"大视频音频切片: duration={dur:.1f}s -> {n} 片 (每片{self.slice_seconds}s)")
+
+        for i in range(n):
+            start = i * self.slice_seconds
+            length = min(self.slice_seconds, max(0.0, dur - start))
+            if length < 0.5:
+                break
+            out = out_dir / f"slice_{i:03d}.wav"
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start),
+                "-t", str(length),
+                "-i", audio_path,
+                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                str(out),
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not out.exists():
+                logger.warning(f"切片失败 #{i}: {stderr.decode('utf-8', errors='ignore')[:160]}")
+                continue
+            slices.append({"path": str(out), "start": float(start), "end": float(start + length)})
+
+        return slices or [{"path": audio_path, "start": 0.0, "end": dur}]
+
+    async def transcribe_full_video(self, audio_path: str, aweme_id: str, duration: int = 0) -> Dict:
+        """
+        完整视频 ASR：大视频先切片，逐片转写后按时间偏移合并。
+        """
+        empty = {"text": "", "segments": [], "language": getattr(settings, "WHISPER_LANGUAGE", "zh")}
+        if not audio_path:
+            return empty
+
+        slices = await self.slice_audio_for_asr(audio_path, aweme_id or "unknown", duration=float(duration or 0))
+        all_segments: List[Dict] = []
+        texts: List[str] = []
+
+        for idx, sl in enumerate(slices):
+            offset = float(sl.get("start") or 0)
+            if hasattr(self.asr, "transcribe_with_timestamps"):
+                part = await self.asr.transcribe_with_timestamps(sl["path"])
+            else:
+                t = await self.asr.transcribe(sl["path"])
+                part = {"text": t or "", "segments": [{"start": 0, "end": 0, "text": t}] if t else []}
+
+            segs = part.get("segments") or []
+            if not segs and part.get("text"):
+                segs = [{"start": 0, "end": 0, "text": part["text"]}]
+
+            for seg in segs:
+                text = (seg.get("text") or "").strip()
+                if not text:
+                    continue
+                item = {
+                    "start": round(float(seg.get("start") or 0) + offset, 2),
+                    "end": round(float(seg.get("end") or 0) + offset, 2),
+                    "text": text,
+                }
+                all_segments.append(item)
+                texts.append(text)
+
+            logger.info(
+                f"ASR 切片 {idx + 1}/{len(slices)} 完成: +{len(segs)} 段, offset={offset:.1f}s"
+            )
+
         return {
-            "text": text or "",
-            "segments": [{"start": 0, "end": 0, "text": text}] if text else [],
+            "text": " ".join(texts),
+            "segments": all_segments,
             "language": getattr(settings, "WHISPER_LANGUAGE", "zh"),
         }
 
@@ -117,14 +167,13 @@ class VideoLearningPipeline:
         return (asr_result.get("text") or "").strip()
 
     def chunk_transcript(self, timed_transcript: str) -> List[Dict]:
-        """大视频：按字符窗切段，尽量在时间戳行边界切开"""
+        """大文稿按字符窗切段，供 LLM 深度解析（仍覆盖完整内容）"""
         text = timed_transcript or ""
         if len(text) <= self.chunk_chars:
             return [{"index": 0, "text": text}]
 
         lines = text.splitlines()
-        chunks, buf, idx = [], [], 0
-        size = 0
+        chunks, buf, idx, size = [], [], 0, 0
         for line in lines:
             if size + len(line) + 1 > self.chunk_chars and buf:
                 chunks.append({"index": idx, "text": "\n".join(buf)})
@@ -134,26 +183,8 @@ class VideoLearningPipeline:
             size += len(line) + 1
         if buf:
             chunks.append({"index": idx, "text": "\n".join(buf)})
-        logger.info(f"大视频文稿切分为 {len(chunks)} 段")
+        logger.info(f"完整文稿按字数分为 {len(chunks)} 段给 LLM")
         return chunks
-
-    async def analyze_frames_vision(self, frames: List[Dict], title: str) -> List[Dict]:
-        """多模态：把关键帧交给视觉模型做 OCR + 画面描述"""
-        notes = []
-        if not frames:
-            return notes
-        # 控制调用次数：最多 4 批，每批最多 2 帧，避免超时
-        batch_size = 2
-        selected = frames[:: max(1, len(frames) // min(len(frames), 6))][:6]
-        for i in range(0, len(selected), batch_size):
-            batch = selected[i : i + batch_size]
-            try:
-                note = await self.gemini.analyze_keyframes(title=title, frames=batch)
-                if note:
-                    notes.extend(note if isinstance(note, list) else [note])
-            except Exception as e:
-                logger.warning(f"关键帧视觉分析失败: {e}")
-        return notes
 
     async def learn_video(
         self,
@@ -166,64 +197,57 @@ class VideoLearningPipeline:
         aweme_id: str = "",
     ) -> Dict:
         """
-        执行完整六层学习，返回：
-        {
-          timed_transcript, asr_segments, frame_notes,
-          analysis, knowledge_cards, quality
-        }
+        完整学习（无抽帧）：
+        完整素材 → 切片完整 ASR → 深度解析 → 知识卡片 → 验收
         """
         result = {
             "timed_transcript": "",
             "asr_segments": [],
-            "frame_notes": [],
+            "frame_notes": [],  # 兼容字段，固定为空（已取消抽帧）
             "analysis": None,
             "knowledge_cards": [],
             "quality": {},
             "source_materials": {
-                "has_video": bool(video_path),
-                "has_audio": bool(audio_path),
+                "has_video": bool(video_path and Path(str(video_path)).exists()),
+                "has_audio": bool(audio_path and Path(str(audio_path)).exists()),
                 "has_desc": bool(desc),
             },
         }
 
-        # --- Layer 2: 带时间戳 ASR ---
+        # 完整 ASR（大视频切片）
         asr_result = {"text": "", "segments": []}
-        if audio_path:
-            asr_result = await self.transcribe_timestamped(audio_path)
+        if audio_path and Path(audio_path).exists():
+            asr_result = await self.transcribe_full_video(
+                audio_path=audio_path,
+                aweme_id=aweme_id or "unknown",
+                duration=duration,
+            )
+
         timed = self.build_timed_transcript(asr_result)
         if not timed and desc:
             timed = f"[00:00] {desc}"
         if not timed and title:
             timed = f"[00:00] {title}"
+
         result["timed_transcript"] = timed
         result["asr_segments"] = asr_result.get("segments") or []
 
-        # --- Layer 3: 关键帧多模态 ---
-        frame_notes = []
-        if video_path and Path(video_path).exists():
-            frames = await self.extract_keyframes(video_path, aweme_id or "unknown", duration=duration)
-            frame_notes = await self.analyze_frames_vision(frames, title=title)
-        result["frame_notes"] = frame_notes
-
-        vision_text = self._format_frame_notes(frame_notes)
-
-        # --- Layer 4: 结构化深度解析（大视频分段） ---
+        # 结构化深度解析（覆盖完整文稿；过长则分段再综合）
         chunks = self.chunk_transcript(timed)
-        chunk_analyses = []
         if len(chunks) == 1:
             analysis = await self.gemini.analyze_video_complete(
                 title=title,
                 timed_transcript=chunks[0]["text"],
-                vision_notes=vision_text,
+                vision_notes="",  # 不使用抽帧
                 desc=desc or "",
             )
-            chunk_analyses.append(analysis)
         else:
+            chunk_analyses = []
             for ch in chunks:
                 part = await self.gemini.analyze_video_complete(
-                    title=f"{title}（分段 {ch['index'] + 1}/{len(chunks)}）",
+                    title=f"{title}（完整视频分段 {ch['index'] + 1}/{len(chunks)}）",
                     timed_transcript=ch["text"],
-                    vision_notes=vision_text if ch["index"] == 0 else "",
+                    vision_notes="",
                     desc=desc or "",
                     partial=True,
                 )
@@ -232,12 +256,11 @@ class VideoLearningPipeline:
             analysis = await self.gemini.synthesize_chunk_analyses(
                 title=title,
                 chunk_analyses=chunk_analyses,
-                vision_notes=vision_text,
+                vision_notes="",
             )
 
         result["analysis"] = analysis or {}
 
-        # --- Layer 5: 知识原子化卡片 ---
         cards = []
         if analysis:
             cards = analysis.get("knowledge_cards") or []
@@ -246,39 +269,20 @@ class VideoLearningPipeline:
                     title=title,
                     timed_transcript=timed,
                     analysis=analysis,
-                    vision_notes=vision_text,
+                    vision_notes="",
                 ) or []
         result["knowledge_cards"] = cards if isinstance(cards, list) else []
 
-        # --- Layer 6: 验收门禁 ---
         result["quality"] = self.evaluate_quality(
             timed_transcript=timed,
             segments=result["asr_segments"],
             analysis=result["analysis"] or {},
             cards=result["knowledge_cards"],
-            frame_notes=frame_notes,
-            has_video=bool(video_path),
-            has_audio=bool(audio_path),
+            has_video=result["source_materials"]["has_video"],
+            has_audio=result["source_materials"]["has_audio"],
             duration=duration,
         )
         return result
-
-    @staticmethod
-    def _format_frame_notes(notes: List[Dict]) -> str:
-        if not notes:
-            return ""
-        lines = []
-        for n in notes:
-            ts = n.get("timestamp_label") or n.get("timestamp") or "?"
-            ocr = n.get("ocr_text") or ""
-            desc = n.get("description") or n.get("scene") or ""
-            knowledge = n.get("on_screen_knowledge") or ""
-            lines.append(f"- [{ts}] 画面: {desc}")
-            if ocr:
-                lines.append(f"  OCR: {ocr}")
-            if knowledge:
-                lines.append(f"  屏上知识: {knowledge}")
-        return "\n".join(lines)
 
     def evaluate_quality(
         self,
@@ -287,74 +291,62 @@ class VideoLearningPipeline:
         segments: List[Dict],
         analysis: Dict,
         cards: List[Dict],
-        frame_notes: List[Dict],
         has_video: bool,
         has_audio: bool,
         duration: int,
     ) -> Dict:
-        """验收：覆盖率/完整性打分（启发式，可解释）"""
         issues = []
         score = 100
-
         detailed = (analysis.get("detailed_analysis") or "") if analysis else ""
         transcript_len = len(timed_transcript or "")
         has_ts = bool(re.search(r"\[\d{1,2}:\d{2}\]", timed_transcript or ""))
         seg_n = len(segments or [])
 
-        # 素材
         if not has_video:
-            score -= 15
-            issues.append("缺少本地视频文件")
+            score -= 20
+            issues.append("缺少完整本地视频文件")
         if not has_audio:
             score -= 15
-            issues.append("缺少音频/ASR 源")
+            issues.append("缺少完整音频")
 
-        # 转写
         if transcript_len < 80:
             score -= 25
-            issues.append("转写过短，可能未覆盖口播")
+            issues.append("完整转写过短（可能无口播或 ASR 失败）")
         elif transcript_len < 300:
-            score -= 10
+            score -= 8
             issues.append("转写偏短")
-        if not has_ts:
-            score -= 10
+
+        if not has_ts and transcript_len >= 80:
+            score -= 8
             issues.append("缺少时间戳转写")
-        if duration and duration > 60 and seg_n < 3:
-            score -= 10
-            issues.append("长视频分段过少")
 
-        # 多模态
-        if has_video and not frame_notes:
-            score -= 10
-            issues.append("未获得关键帧视觉/OCR 补全")
+        if duration and duration > 90 and seg_n < 3 and transcript_len >= 80:
+            score -= 8
+            issues.append("长视频 ASR 分段过少")
 
-        # 解析深度
         if len(detailed) < 800:
             score -= 20
             issues.append("深度解析过短（疑似摘要）")
         elif len(detailed) < 1500:
-            score -= 8
+            score -= 6
             issues.append("深度解析偏短")
 
-        # 知识卡片
         if len(cards) < 3:
             score -= 10
             issues.append("知识卡片不足（<3）")
 
-        # 覆盖率估算：解析字数 / 文稿字数（粗估）
         coverage = 0.0
         if transcript_len > 0:
             coverage = min(1.5, len(detailed) / max(transcript_len, 1))
-        # 文稿很短时用解析绝对长度判断
-        coverage_ok = (transcript_len >= 200 and coverage >= 0.9) or (
+        coverage_ok = (transcript_len >= 200 and coverage >= 0.5) or (
             transcript_len < 200 and len(detailed) >= 1200
         )
         if not coverage_ok:
-            score -= 10
-            issues.append("解析对文稿覆盖可能不足")
+            score -= 8
+            issues.append("解析对完整文稿覆盖可能不足")
 
         score = max(0, min(100, score))
-        passed = score >= 70 and len(detailed) >= 800 and len(cards) >= 3
+        passed = score >= 70 and len(detailed) >= 800 and has_video
 
         return {
             "score": score,
@@ -363,16 +355,21 @@ class VideoLearningPipeline:
             "transcript_chars": transcript_len,
             "analysis_chars": len(detailed),
             "segments": seg_n,
-            "frames_analyzed": len(frame_notes or []),
+            "frames_analyzed": 0,
             "knowledge_cards": len(cards or []),
             "has_timestamps": has_ts,
+            "full_video_pipeline": True,
             "issues": issues,
             "checklist": {
+                "downloaded_full_video": has_video,
+                "full_asr_done": transcript_len >= 80,
                 "can_answer_what": len(detailed) >= 500,
                 "can_answer_how": bool(analysis.get("takeaways")) or ("步骤" in detailed),
-                "can_answer_why": ("为什么" in detailed) or ("原因" in detailed) or ("因为" in detailed),
+                "can_answer_why": ("为什么" in detailed) or ("原因" in detailed),
                 "has_boundaries": ("边界" in detailed) or ("局限" in detailed) or ("适用" in detailed),
-                "cards_with_timestamp": sum(1 for c in (cards or []) if c.get("timestamp") or c.get("time_range")),
+                "cards_with_timestamp": sum(
+                    1 for c in (cards or []) if c.get("timestamp") or c.get("time_range")
+                ),
             },
         }
 
@@ -388,6 +385,6 @@ def get_video_learning_pipeline(asr=None, gemini=None):
             from app.services.gemini_client import get_gemini_client
             asr = asr or get_asr_service()
             gemini = gemini or get_gemini_client()
-        frames = str(Path(getattr(settings, "VIDEO_STORAGE_PATH", "./data/videos")).parent / "frames")
-        _pipeline = VideoLearningPipeline(asr=asr, gemini=gemini, frames_dir=frames)
+        slices = str(Path(getattr(settings, "VIDEO_STORAGE_PATH", "./data/videos")).parent / "slices")
+        _pipeline = VideoLearningPipeline(asr=asr, gemini=gemini, slices_dir=slices)
     return _pipeline

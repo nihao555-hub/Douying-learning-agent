@@ -408,7 +408,7 @@ class Orchestrator:
                     await db.commit()
             
             video.status = "summarizing"
-            update_stage("六层完整学习：ASR/关键帧/深度解析/知识卡片...")
+            update_stage("完整学习：切片ASR/深度解析/知识卡片...")
             await db.commit()
             
             learned = await self.pipeline.learn_video(
