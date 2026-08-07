@@ -58,7 +58,7 @@ class DouyinClient:
             )
     
     async def _ensure_base_cookies(self) -> Dict[str, str]:
-        """自动获取抖音基础cookie（ttwid等），这是yt-dlp需要的"""
+        """自动获取抖音基础cookie。优先访问 iesdouyin 分享域（机房IP上 douyin.com 常拿不到cookie）。"""
         if self._base_cookies is not None:
             return self._base_cookies
         
@@ -71,13 +71,19 @@ class DouyinClient:
                 timeout=15,
                 verify=False
             ) as client:
-                # 访问首页获取基础cookie
-                await client.get("https://www.douyin.com/")
-                cookies.update(dict(client.cookies))
-                
-                # 访问discover页面获取更多cookie
-                await client.get("https://www.douyin.com/discover")
-                cookies.update(dict(client.cookies))
+                # 1) iesdouyin 分享域更容易下发 ttwid / __ac_nonce
+                seed_urls = [
+                    "https://www.iesdouyin.com/",
+                    "https://www.iesdouyin.com/share/video/7234567890123456789",
+                    "https://www.douyin.com/",
+                    "https://www.douyin.com/discover",
+                ]
+                for u in seed_urls:
+                    try:
+                        await client.get(u)
+                        cookies.update(dict(client.cookies))
+                    except Exception:
+                        continue
             
             logger.info(f"获取到 {len(cookies)} 个基础cookie: {list(cookies.keys())}")
             self._base_cookies = cookies

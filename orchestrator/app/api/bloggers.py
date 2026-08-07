@@ -38,6 +38,10 @@ class VideoResponse(BaseModel):
     topics: Optional[list] = None
     takeaways: Optional[str] = None
     transcript: Optional[str] = None
+    transcript_segments: Optional[list] = None
+    frame_notes: Optional[list] = None
+    knowledge_cards: Optional[list] = None
+    quality_report: Optional[dict] = None
     
     class Config:
         from_attributes = True

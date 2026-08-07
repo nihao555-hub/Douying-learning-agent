@@ -17,6 +17,7 @@ from app.services.douyin_client import get_douyin_client
 from app.services.asr_service import get_asr_service
 from app.services.gemini_client import get_gemini_client
 from app.services.knowledge_base import get_knowledge_base
+from app.services.video_learning_pipeline import get_video_learning_pipeline
 
 
 class Orchestrator:
@@ -27,6 +28,7 @@ class Orchestrator:
         self.asr = get_asr_service()
         self.gemini = get_gemini_client()
         self.kb = get_knowledge_base()
+        self.pipeline = get_video_learning_pipeline(self.asr, self.gemini)
         
         self.audio_dir = Path(settings.AUDIO_STORAGE_PATH)
         self.transcript_dir = Path(settings.TRANSCRIPT_STORAGE_PATH)
@@ -365,120 +367,109 @@ class Orchestrator:
         video_num: int = 0,
         total: int = 0,
     ) -> bool:
-        """处理单个视频：下载 → 提取音频 → ASR → AI完整深度解析（含重试时的状态重置）"""
+        """
+        六层完整学习：
+        素材下载 → 音频 → 时间戳ASR → 关键帧多模态 → 结构化深度解析
+        → 知识卡片入库 → 验收门禁
+        注意：不是把整段大视频直接塞给 LLM；而是 ASR+关键帧后再解析（大视频自动分段）。
+        """
         try:
             def update_stage(stage_text):
-                """更新当前处理阶段（串行模式；并发模式由外层进度回调负责）"""
                 if blogger and video_num and total:
                     blogger.current_stage = f"[{video_num}/{total}] {stage_text}"
             
-            # 重置视频状态（重试时清理上次失败的标记）
             video.status = "downloading"
             video.error_message = None
-            update_stage(f"下载视频: {video.title[:35]}...")
+            update_stage(f"下载完整素材: {video.title[:35]}...")
             await db.commit()
             
-            # 1. 下载视频
             video_path = None
-            if video.local_video_path:
-                from pathlib import Path
-                if Path(video.local_video_path).exists():
-                    video_path = video.local_video_path
-                    logger.info(f"视频已缓存: {video.aweme_id}")
+            if video.local_video_path and Path(video.local_video_path).exists():
+                video_path = video.local_video_path
+                logger.info(f"视频已缓存: {video.aweme_id}")
             
             if not video_path:
-                video_path = await self.douyin.download_video(
-                    video.video_url,
-                    video.aweme_id
-                )
+                video_path = await self.douyin.download_video(video.video_url, video.aweme_id)
             
             if video_path:
                 video.local_video_path = video_path
                 await db.commit()
             else:
-                logger.warning(f"视频下载失败，尝试使用描述文本: {video.title}")
+                logger.warning(f"视频下载失败，将尽量用描述/分享页文案继续: {video.title}")
             
-            # 2. 提取音频并ASR转文字
-            transcript = ""
+            audio_path = None
             if video_path:
                 video.status = "transcribing"
-                update_stage("提取音频并语音转文字...")
+                update_stage("提取音频...")
                 await db.commit()
-                
                 audio_path = await self._extract_audio(video_path, video.aweme_id)
-                
                 if audio_path:
                     video.local_audio_path = audio_path
                     await db.commit()
-                    
-                    update_stage("正在语音识别...")
-                    await db.commit()
-                    transcript = await self.asr.transcribe(audio_path)
-                
-                if not transcript and video.desc:
-                    transcript = video.desc
-            else:
-                transcript = video.desc or video.title
             
-            if not transcript:
-                logger.warning(f"视频无文字内容: {video.title}")
+            video.status = "summarizing"
+            update_stage("六层完整学习：ASR/关键帧/深度解析/知识卡片...")
+            await db.commit()
+            
+            learned = await self.pipeline.learn_video(
+                title=video.title or "",
+                desc=video.desc or "",
+                video_path=video_path,
+                audio_path=audio_path,
+                duration=int(video.duration or 0),
+                aweme_id=video.aweme_id,
+            )
+            
+            timed = learned.get("timed_transcript") or video.desc or video.title or ""
+            if not timed:
                 video.status = "failed"
-                video.error_message = "无法获取文字内容（下载失败且无描述）"
+                video.error_message = "无法获取可学习文本（无ASR/无描述）"
                 await db.commit()
                 return False
             
-            video.transcript = transcript
-            await db.commit()
+            video.transcript = timed
+            video.transcript_segments = learned.get("asr_segments") or []
+            video.frame_notes = learned.get("frame_notes") or []
+            video.knowledge_cards = learned.get("knowledge_cards") or []
+            video.quality_report = learned.get("quality") or {}
             
             transcript_path = self.transcript_dir / f"{video.aweme_id}.txt"
-            transcript_path.write_text(transcript, encoding='utf-8')
+            transcript_path.write_text(timed, encoding="utf-8")
             
-            # 3. AI 完整深度解析（不是摘要）
-            video.status = "summarizing"
-            update_stage("AI 完整深度解析...")
-            await db.commit()
-            
-            analysis = await self.gemini.analyze_video(video.title, transcript)
-            
-            if not analysis:
-                video.status = "failed"
-                video.error_message = "AI解析返回空结果"
-                await db.commit()
-                return False
-            
-            # 保存完整深度解析：detailed_analysis 为主体，summary 仅作文末短摘要
+            analysis = learned.get("analysis") or {}
             detailed = (analysis.get("detailed_analysis") or "").strip()
             summary = (analysis.get("summary") or "").strip()
+            quality = video.quality_report or {}
             
-            # 若模型把全文塞进 summary，则提升为详细解析
-            if not detailed and summary and len(summary) > 500:
-                detailed = summary
-                summary = summary[:300] + "..."
+            quality_block = (
+                f"\n\n---\n\n**学习验收**：得分 {quality.get('score', 0)} / "
+                f"{'通过' if quality.get('passed') else '未通过'}；"
+                f"转写{quality.get('transcript_chars', 0)}字；"
+                f"解析{quality.get('analysis_chars', 0)}字；"
+                f"卡片{quality.get('knowledge_cards', 0)}张；"
+                f"关键帧{quality.get('frames_analyzed', 0)}；"
+                f"问题：{', '.join(quality.get('issues') or []) or '无'}"
+            )
             
             if detailed and summary:
-                video.summary = f"{detailed}\n\n---\n\n**摘要**：{summary}"
+                video.summary = f"{detailed}\n\n---\n\n**摘要**：{summary}{quality_block}"
             else:
-                video.summary = detailed or summary
-            
-            if not video.summary or len(video.summary) < 200:
-                logger.warning(
-                    f"解析结果过短({len(video.summary or '')}字)，可能不是完整深度解析: {video.title[:30]}"
-                )
+                video.summary = (detailed or summary or timed) + quality_block
             
             key_points = analysis.get("key_points", [])
             if isinstance(key_points, str):
-                import json
+                import json as _json
                 try:
-                    key_points = json.loads(key_points)
+                    key_points = _json.loads(key_points)
                 except Exception:
                     key_points = [key_points]
             video.key_points = key_points if isinstance(key_points, list) else []
             
             topics = analysis.get("topics", [])
             if isinstance(topics, str):
-                import json
+                import json as _json
                 try:
-                    topics = json.loads(topics)
+                    topics = _json.loads(topics)
                 except Exception:
                     topics = [topics]
             video.topics = topics if isinstance(topics, list) else []
@@ -495,16 +486,24 @@ class Orchestrator:
                     blogger_id=video.blogger_id,
                     video_id=video.id,
                     title=video.title,
-                    content=transcript,
-                    summary=video.summary
+                    content=timed,
+                    summary=video.summary,
                 )
+                if hasattr(self.kb, "add_knowledge_cards"):
+                    await self.kb.add_knowledge_cards(
+                        blogger_id=video.blogger_id,
+                        video_id=video.id,
+                        title=video.title,
+                        cards=video.knowledge_cards or [],
+                    )
             except Exception as e:
                 logger.warning(f"添加到知识库失败: {e}")
             
             await db.commit()
             logger.info(
-                f"视频完整解析完成: {video.title[:30]}... "
-                f"(解析长度={len(video.summary or '')}字)"
+                f"完整学习完成: {video.title[:30]}... "
+                f"解析={len(detailed)}字 cards={len(video.knowledge_cards or [])} "
+                f"quality={quality.get('score')} passed={quality.get('passed')}"
             )
             return True
             

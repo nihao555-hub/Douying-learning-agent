@@ -175,6 +175,53 @@ class KnowledgeBaseService:
             logger.warning(f"添加文档失败（不影响主流程）: {e}")
             return True
     
+    async def add_knowledge_cards(
+        self,
+        blogger_id: int,
+        video_id: int,
+        title: str,
+        cards: List[Dict],
+    ) -> bool:
+        """将知识原子卡片写入向量库（带时间戳元数据，便于追问定位）"""
+        if not self.available or not cards:
+            return True
+        import asyncio
+
+        def _add():
+            collection = self._get_collection(blogger_id)
+            if collection is None:
+                return True
+            ids, documents, metadatas = [], [], []
+            for i, card in enumerate(cards[:40]):
+                if not isinstance(card, dict):
+                    continue
+                ctitle = str(card.get("title") or f"卡片{i+1}")
+                content = str(card.get("content") or "")
+                ts = str(card.get("timestamp") or card.get("time_range") or "")
+                ctype = str(card.get("type") or "concept")
+                doc = f"【{ctype}】{ctitle}\n时间: {ts}\n{content}\n来源视频: {title}"
+                ids.append(f"card_{video_id}_{i}")
+                documents.append(doc)
+                metadatas.append({
+                    "video_id": video_id,
+                    "aweme_id": f"video_{video_id}",
+                    "title": title,
+                    "card_type": ctype,
+                    "timestamp": ts,
+                    "source": "knowledge_card",
+                })
+            if not ids:
+                return True
+            collection.add(ids=ids, documents=documents, metadatas=metadatas)
+            logger.info(f"知识卡片入库 {len(ids)} 张 (video_id={video_id})")
+            return True
+
+        try:
+            return await asyncio.to_thread(_add)
+        except Exception as e:
+            logger.warning(f"知识卡片入库失败: {e}")
+            return True
+
     def search(
         self,
         blogger_id: int,
