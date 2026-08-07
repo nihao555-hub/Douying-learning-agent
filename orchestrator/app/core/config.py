@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     VIDEO_CHUNK_CHARS: int = 8000
     VIDEO_SLICE_SECONDS: int = 120
     MAX_VIDEOS_PER_BLOGGER: int = 0
+    # 同时跑完整流水线的 worker 数（下载+ASR+解析很重；过大易导致全部卡住、成功数为0）
+    # MAX_CONCURRENT_VIDEOS 仍可作为硬上限；实际并发 = min(二者)
+    # CPU ASR 场景建议 2–6；过高会把事件循环拖死，前端一直显示处理中/无成功
+    MAX_PIPELINE_WORKERS: int = 4
     
     class Config:
         env_file = ".env"

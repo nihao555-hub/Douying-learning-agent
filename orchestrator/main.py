@@ -57,6 +57,17 @@ async def startup():
         logger.info(f"前端静态资源: {DASHBOARD_DIST}")
     else:
         logger.warning(f"前端 dist 不存在: {DASHBOARD_DIST}")
+    # 恢复被重启打断的任务，避免长期「处理中 / 成功 0」
+    try:
+        from app.services.orchestrator import get_orchestrator
+
+        async def _delayed_recover():
+            await asyncio.sleep(3)
+            await get_orchestrator().recover_interrupted_jobs()
+
+        asyncio.create_task(_delayed_recover())
+    except Exception as e:
+        logger.warning(f"启动恢复任务失败: {e}")
     logger.info("编排服务启动完成")
 
 

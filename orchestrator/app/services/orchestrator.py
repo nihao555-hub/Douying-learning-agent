@@ -35,10 +35,253 @@ class Orchestrator:
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
         
-        # 总并发上限（默认 1000）
+        # 总并发硬上限（默认 1000）与实际流水线 worker（默认 20）
         self.max_concurrency = max(1, int(getattr(settings, "MAX_CONCURRENT_VIDEOS", 1000) or 1000))
+        pipeline_workers = max(1, int(getattr(settings, "MAX_PIPELINE_WORKERS", 20) or 20))
+        self.pipeline_concurrency = max(1, min(self.max_concurrency, pipeline_workers))
         self._progress_lock = asyncio.Lock()
-    
+        self._active_blogger_tasks: set[int] = set()
+
+    async def recover_interrupted_jobs(self):
+        """
+        服务重启后恢复：把仍停在 downloading/summarizing 的博主继续处理未完成视频。
+        避免前端长期显示「处理中」但成功数为 0。
+        """
+        async with async_session() as db:
+            result = await db.execute(
+                select(Blogger).where(
+                    Blogger.status.in_(
+                        ["pending", "crawling", "downloading", "transcribing", "summarizing", "processing"]
+                    )
+                )
+            )
+            stuck = list(result.scalars().all())
+
+        if not stuck:
+            logger.info("无中断任务需要恢复")
+            return
+
+        for blogger in stuck:
+            logger.warning(
+                f"检测到中断任务，准备恢复: {blogger.nickname} "
+                f"(status={blogger.status}, total={blogger.total_videos}, processed={blogger.processed_videos})"
+            )
+            asyncio.create_task(self.resume_unfinished_videos(blogger.id))
+
+    async def resume_unfinished_videos(self, blogger_id: int) -> bool:
+        """只处理未完成视频，并刷新综合文档。"""
+        if blogger_id in self._active_blogger_tasks:
+            logger.info(f"博主 {blogger_id} 已有任务在跑，跳过重复恢复")
+            return False
+        self._active_blogger_tasks.add(blogger_id)
+        try:
+            async with async_session() as db:
+                blogger = (
+                    await db.execute(select(Blogger).where(Blogger.id == blogger_id))
+                ).scalar_one_or_none()
+                if not blogger:
+                    return False
+
+                unfinished = list(
+                    (
+                        await db.execute(
+                            select(Video)
+                            .where(
+                                Video.blogger_id == blogger_id,
+                                Video.status.in_(
+                                    [
+                                        "pending",
+                                        "downloading",
+                                        "transcribing",
+                                        "summarizing",
+                                        "failed",
+                                    ]
+                                ),
+                            )
+                            .order_by(Video.id.asc())
+                        )
+                    ).scalars().all()
+                )
+                done_n = (
+                    await db.execute(
+                        select(Video).where(
+                            Video.blogger_id == blogger_id,
+                            Video.status == "summarized",
+                        )
+                    )
+                ).scalars().all()
+                done_count = len(list(done_n))
+                total = int(blogger.total_videos or 0) or (done_count + len(unfinished))
+
+                if not unfinished:
+                    blogger.processed_videos = done_count
+                    blogger.summarized_videos = done_count
+                    if done_count > 0:
+                        blogger.status = "summarizing"
+                        blogger.current_stage = "正在生成综合知识文档..."
+                        blogger.progress = 90
+                        await db.commit()
+                        summarized = list(
+                            (
+                                await db.execute(
+                                    select(Video).where(
+                                        Video.blogger_id == blogger_id,
+                                        Video.status == "summarized",
+                                    )
+                                )
+                            ).scalars().all()
+                        )
+                        await self._generate_master_doc(db, blogger, summarized)
+                        blogger.status = "completed"
+                        blogger.progress = 100
+                        blogger.current_stage = f"处理完成！共分析 {done_count} 个视频"
+                        blogger.completed_at = datetime.utcnow()
+                        await db.commit()
+                    else:
+                        blogger.status = "failed"
+                        blogger.error_message = "没有可恢复的未完成视频"
+                        await db.commit()
+                    return done_count > 0
+
+                blogger.status = "downloading"
+                blogger.error_message = None
+                blogger.processed_videos = done_count
+                blogger.current_stage = (
+                    f"恢复处理未完成视频：已成功 {done_count}/{total}，"
+                    f"待处理 {len(unfinished)}..."
+                )
+                blogger.progress = int(20 + done_count / max(total, 1) * 70)
+                await db.commit()
+
+            sem = asyncio.Semaphore(self.pipeline_concurrency)
+            completed_extra = 0
+            success_extra = 0
+            count_lock = asyncio.Lock()
+
+            async def process_one(video_id: int, video_num: int) -> bool:
+                nonlocal completed_extra, success_extra
+                async with sem:
+                    async with async_session() as task_db:
+                        video = (
+                            await task_db.execute(select(Video).where(Video.id == video_id))
+                        ).scalar_one_or_none()
+                        if not video:
+                            return False
+                        if video.status == "summarized":
+                            return True
+
+                        short_title = (video.title or "")[:40]
+                        await self._update_blogger_progress(
+                            blogger_id,
+                            stage=f"[{video_num}/{total}] 处理中: {short_title}...",
+                            status="downloading",
+                            current_index=video_num,
+                        )
+
+                        success = False
+                        for attempt in range(1, 4):
+                            if attempt > 1:
+                                await asyncio.sleep(1.5 * attempt)
+                            success = await self._process_single_video(
+                                task_db, video, None, video_num, total
+                            )
+                            if success:
+                                break
+
+                        async with count_lock:
+                            completed_extra += 1
+                            if success:
+                                success_extra += 1
+                            processed_now = done_count + success_extra
+                            done_all = done_count + completed_extra
+                            prog = int(20 + done_all / max(total, 1) * 70)
+
+                        await self._update_blogger_progress(
+                            blogger_id,
+                            processed=processed_now,
+                            progress=prog,
+                            current_index=done_all,
+                            stage=(
+                                f"[{done_all}/{total}] "
+                                + ("完成: " if success else "失败: ")
+                                + short_title
+                            ),
+                        )
+                        return success
+
+            logger.info(
+                f"恢复并发处理博主#{blogger_id}: unfinished={len(unfinished)} "
+                f"already_done={done_count} pipeline={self.pipeline_concurrency}"
+            )
+            results = await asyncio.gather(
+                *[
+                    process_one(v.id, done_count + i + 1)
+                    for i, v in enumerate(unfinished)
+                ],
+                return_exceptions=True,
+            )
+            ok = sum(1 for r in results if r is True)
+
+            async with async_session() as db:
+                blogger = (
+                    await db.execute(select(Blogger).where(Blogger.id == blogger_id))
+                ).scalar_one_or_none()
+                if not blogger:
+                    return False
+                summarized = list(
+                    (
+                        await db.execute(
+                            select(Video).where(
+                                Video.blogger_id == blogger_id,
+                                Video.status == "summarized",
+                            )
+                        )
+                    ).scalars().all()
+                )
+                blogger.processed_videos = len(summarized)
+                blogger.summarized_videos = len(summarized)
+                blogger.status = "summarizing"
+                blogger.current_stage = "正在生成综合知识文档..."
+                blogger.progress = 90
+                await db.commit()
+
+                if summarized:
+                    await self._generate_master_doc(db, blogger, summarized)
+
+                blogger.status = "completed"
+                blogger.progress = 100
+                blogger.current_stage = (
+                    f"处理完成！共分析 {len(summarized)} 个视频"
+                    + (f"（本次恢复成功 {ok}）" if ok else "")
+                )
+                blogger.completed_at = datetime.utcnow()
+                if len(summarized) < total:
+                    blogger.error_message = (
+                        f"部分完成：成功 {len(summarized)}/{total}。"
+                        "失败视频可点刷新重试。"
+                    )
+                await db.commit()
+                logger.info(
+                    f"恢复完成: {blogger.nickname} 成功 {len(summarized)}/{total}"
+                )
+                return True
+        except Exception as e:
+            logger.error(f"恢复博主#{blogger_id}失败: {e}", exc_info=True)
+            try:
+                async with async_session() as db:
+                    blogger = (
+                        await db.execute(select(Blogger).where(Blogger.id == blogger_id))
+                    ).scalar_one_or_none()
+                    if blogger:
+                        blogger.status = "failed"
+                        blogger.error_message = f"恢复失败: {str(e)[:300]}"
+                        await db.commit()
+            except Exception:
+                pass
+            return False
+        finally:
+            self._active_blogger_tasks.discard(blogger_id)
+
     async def add_blogger(self, db: AsyncSession, url: str) -> Optional[Blogger]:
         """添加博主并开始处理"""
         try:
@@ -95,9 +338,16 @@ class Orchestrator:
     
     async def process_blogger(self, db: AsyncSession, blogger_id: int, source_url: str = "") -> bool:
         """完整处理博主 - 使用独立数据库session，适合后台任务运行"""
-        # 创建独立的数据库session，避免依赖API请求的session（请求结束后会关闭）
-        async with async_session() as own_db:
-            return await self._process_blogger_impl(own_db, blogger_id, source_url)
+        if blogger_id in self._active_blogger_tasks:
+            logger.info(f"博主 {blogger_id} 已有处理任务，跳过")
+            return False
+        self._active_blogger_tasks.add(blogger_id)
+        try:
+            # 创建独立的数据库session，避免依赖API请求的session（请求结束后会关闭）
+            async with async_session() as own_db:
+                return await self._process_blogger_impl(own_db, blogger_id, source_url)
+        finally:
+            self._active_blogger_tasks.discard(blogger_id)
     
     async def _update_blogger_progress(
         self,
@@ -218,15 +468,15 @@ class Orchestrator:
             )
             blogger.current_stage = (
                 f"{stage_prefix}准备并发处理 {len(videos_info)} 个视频 "
-                f"(并发={self.max_concurrency})..."
+                f"(流水线并发={self.pipeline_concurrency}/{self.max_concurrency})..."
             )
             blogger.progress = 20
             blogger.status = "downloading"
             await db.commit()
             
-            # 2. 并发处理视频（Semaphore 限制最大并发）
+            # 2. 并发处理视频（Semaphore 限制实际流水线并发，避免全部卡住）
             total_videos = len(videos_info)
-            sem = asyncio.Semaphore(self.max_concurrency)
+            sem = asyncio.Semaphore(self.pipeline_concurrency)
             completed_count = 0
             success_ids: List[int] = []
             count_lock = asyncio.Lock()
@@ -281,18 +531,22 @@ class Orchestrator:
                             
                             async with count_lock:
                                 completed_count += 1
+                                if success:
+                                    success_ids.append(video.id)
                                 done = completed_count
+                                success_n = len(success_ids)
                                 prog = int(20 + done / max(total_videos, 1) * 70)
                             
                             await self._update_blogger_progress(
                                 blogger_id,
-                                processed=done,
+                                processed=success_n,
                                 progress=prog,
                                 current_index=done,
                                 stage=(
                                     f"[{done}/{total_videos}] "
                                     + ("完成: " if success else "失败: ")
                                     + short_title
+                                    + f"（成功 {success_n}）"
                                 ),
                             )
                             
@@ -310,7 +564,7 @@ class Orchestrator:
             
             logger.info(
                 f"========== 开始并发处理 {total_videos} 个视频 "
-                f"(max_concurrency={self.max_concurrency}) =========="
+                f"(pipeline={self.pipeline_concurrency}, hard_cap={self.max_concurrency}) =========="
             )
             results = await asyncio.gather(
                 *[process_one(i, v) for i, v in enumerate(videos_info)],
@@ -318,18 +572,17 @@ class Orchestrator:
             )
             
             for r in results:
-                if isinstance(r, int):
-                    success_ids.append(r)
-                elif isinstance(r, Exception):
+                if isinstance(r, Exception):
                     logger.error(f"并发任务异常: {r}")
             
-            # 重新加载成功的视频对象供综合文档使用
-            video_objects: List[Video] = []
-            if success_ids:
-                result = await db.execute(
-                    select(Video).where(Video.id.in_(success_ids))
+            # success_ids 已在并发过程中收集；再按 DB 校正
+            result = await db.execute(
+                select(Video).where(
+                    Video.blogger_id == blogger_id,
+                    Video.status == "summarized",
                 )
-                video_objects = list(result.scalars().all())
+            )
+            video_objects = list(result.scalars().all())
             
             logger.info(
                 f"并发处理完成: 成功 {len(video_objects)}/{total_videos}"

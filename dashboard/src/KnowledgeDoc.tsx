@@ -302,8 +302,29 @@ export default function KnowledgeDoc({ bloggerId, onBack }: KnowledgeDocProps) {
                       </>
                     )}
                     {video.status !== 'summarized' && (
-                      <Badge variant="outline" className="h-4 px-1 text-[10px] text-orange-500 border-orange-200">
-                        {video.status === 'failed' ? '失败' : '处理中'}
+                      <Badge variant="outline" className={`h-4 px-1 text-[10px] ${
+                        video.status === 'failed'
+                          ? 'text-[#DC2626] border-[#FECACA]'
+                          : video.status === 'pending'
+                            ? 'text-[#888] border-[#E5E5E5]'
+                            : 'text-[#D97706] border-[#FDE68A]'
+                      }`}>
+                        {video.status === 'failed'
+                          ? '失败'
+                          : video.status === 'pending'
+                            ? '等待'
+                            : video.status === 'downloading'
+                              ? '下载中'
+                              : video.status === 'transcribing'
+                                ? '转写中'
+                                : video.status === 'summarizing'
+                                  ? '解析中'
+                                  : '处理中'}
+                      </Badge>
+                    )}
+                    {video.status === 'summarized' && (
+                      <Badge variant="outline" className="h-4 px-1 text-[10px] text-[#16A34A] border-[#BBF7D0]">
+                        已完成
                       </Badge>
                     )}
                   </div>

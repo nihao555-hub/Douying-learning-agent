@@ -48,6 +48,8 @@ interface Blogger {
   total_videos: number
   processed_videos: number
   summarized_videos: number
+  failed_videos?: number
+  pending_videos?: number
   current_video_index: number
   progress: number
   current_stage: string
@@ -260,6 +262,18 @@ export default function App() {
     }
   }
 
+  const handleResume = async (id: number) => {
+    try {
+      await fetch(`${API_BASE}/api/bloggers/${id}/resume`, { method: 'POST' })
+      toast.success('已开始恢复未完成视频', {
+        description: '已成功的视频会保留，只重试未完成项',
+      })
+      fetchBloggers()
+    } catch {
+      toast.error('恢复失败')
+    }
+  }
+
   const handleDelete = async (id: number) => {
     if (!confirm('确定删除该博主及其所有数据？')) return
     try {
@@ -305,8 +319,11 @@ export default function App() {
   }
 
   const totalBloggers = bloggers.length
-  const totalVideos = bloggers.reduce((sum, b) => sum + b.total_videos, 0)
-  const processedVideos = bloggers.reduce((sum, b) => sum + b.processed_videos, 0)
+  const totalVideos = bloggers.reduce((sum, b) => sum + (b.total_videos || 0), 0)
+  const processedVideos = bloggers.reduce(
+    (sum, b) => sum + (b.summarized_videos || b.processed_videos || 0),
+    0,
+  )
   const completionRate = totalVideos > 0 ? Math.round((processedVideos / totalVideos) * 100) : 0
 
   return (
@@ -676,7 +693,21 @@ export default function App() {
                                 {formatVideoCount(blogger)}
                               </span>
                               <span className="text-[#DDD]">·</span>
-                              <span>{blogger.processed_videos} 已处理</span>
+                              <span className="text-[#16A34A]">
+                                成功 {blogger.summarized_videos || blogger.processed_videos || 0}
+                              </span>
+                              {(blogger.failed_videos || 0) > 0 && (
+                                <>
+                                  <span className="text-[#DDD]">·</span>
+                                  <span className="text-[#DC2626]">失败 {blogger.failed_videos}</span>
+                                </>
+                              )}
+                              {(blogger.pending_videos || 0) > 0 && (
+                                <>
+                                  <span className="text-[#DDD]">·</span>
+                                  <span className="text-[#2C5FFF]">处理中 {blogger.pending_videos}</span>
+                                </>
+                              )}
                             </div>
 
                             {isCrawlTruncated(blogger) && (
@@ -696,13 +727,12 @@ export default function App() {
                                   </span>
                                   <span className="shrink-0 text-[10px] font-medium text-[#2C5FFF]">
                                     {blogger.status === 'crawling' ? (
-                                      // 爬取阶段：显示已获取数量
-                                      blogger.total_videos > 0 
-                                        ? `已获取 ${blogger.total_videos} 个视频` 
+                                      blogger.total_videos > 0
+                                        ? `已获取 ${blogger.total_videos} 个视频`
                                         : '正在获取...'
                                     ) : blogger.total_videos > 0 ? (
-                                      // 处理阶段：显示 已处理/总数
-                                      `${blogger.current_video_index || blogger.processed_videos || 0}/${blogger.total_videos}`
+                                      `成功 ${blogger.summarized_videos || blogger.processed_videos || 0}/${blogger.total_videos}`
+                                      + ((blogger.pending_videos || 0) > 0 ? ` · 进行中 ${blogger.pending_videos}` : '')
                                     ) : (
                                       `${Math.round(blogger.progress)}%`
                                     )}
@@ -711,7 +741,14 @@ export default function App() {
                                 <div className="h-1.5 overflow-hidden rounded-full bg-[#EEF2FF]">
                                   <div
                                     className="h-full rounded-full bg-gradient-to-r from-[#2C5FFF] to-[#5B8DEF] transition-all duration-500 ease-out"
-                                    style={{ width: `${Math.max(blogger.progress, 2)}%` }}
+                                    style={{
+                                      width: `${Math.max(
+                                        blogger.total_videos > 0
+                                          ? ((blogger.summarized_videos || blogger.processed_videos || 0) / blogger.total_videos) * 100
+                                          : blogger.progress,
+                                        2,
+                                      )}%`,
+                                    }}
                                   />
                                 </div>
                               </div>
@@ -729,6 +766,17 @@ export default function App() {
 
                           {/* 操作按钮 */}
                           <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                            {(blogger.pending_videos || 0) > 0 || blogger.status === 'failed' ? (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-[#999] hover:text-[#16A34A] hover:bg-[#F0FDF4]"
+                                onClick={() => handleResume(blogger.id)}
+                                title="恢复未完成视频"
+                              >
+                                <Play size={14} />
+                              </Button>
+                            ) : null}
                             <Button
                               variant="ghost"
                               size="icon"

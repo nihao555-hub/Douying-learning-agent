@@ -78,6 +78,7 @@ async def get_config():
         "whisper_device": settings.WHISPER_DEVICE,
         "max_videos_per_blogger": settings.MAX_VIDEOS_PER_BLOGGER,
         "max_concurrent_videos": getattr(settings, "MAX_CONCURRENT_VIDEOS", 1000),
+        "max_pipeline_workers": getattr(settings, "MAX_PIPELINE_WORKERS", 20),
         "video_slice_seconds": getattr(settings, "VIDEO_SLICE_SECONDS", 120),
         "full_video_pipeline": True,
         "no_frame_extraction": True,
