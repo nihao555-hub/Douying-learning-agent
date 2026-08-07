@@ -9,6 +9,9 @@ python-dotenv==1.0.0
 loguru==0.7.2
 tqdm==4.66.1
 requests==2.31.0
+# 抖音爬虫 / 下载
+f2>=0.0.1.7
+yt-dlp>=2024.1.0
 # 视频处理
 moviepy==1.0.3
 # 语音识别 - faster-whisper

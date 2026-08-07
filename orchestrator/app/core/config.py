@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     
     # 抖音爬虫 API
     DOUYIN_API_BASE_URL: str = "http://localhost:5000"
+    # 抖音登录 Cookie（必需才能翻页获取博主全部视频；未登录 API 硬限制约 40-44 条）
+    DOUYIN_COOKIE: str = ""
     
     # Dify 配置
     DIFY_API_BASE_URL: str = "http://localhost:8080"
@@ -45,6 +47,8 @@ class Settings(BaseSettings):
     # 任务配置
     MAX_CONCURRENT_DOWNLOADS: int = 3
     MAX_CONCURRENT_TRANSCRIBE: int = 2
+    # 视频处理总并发上限（下载+ASR+AI解析流水线）
+    MAX_CONCURRENT_VIDEOS: int = 1000
     REQUEST_INTERVAL: int = 2
     MAX_VIDEOS_PER_BLOGGER: int = 0
     

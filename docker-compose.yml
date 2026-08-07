@@ -52,6 +52,10 @@ services:
       - TZ=Asia/Shanghai
       # 抖音爬虫 API 地址（容器内访问）
       - DOUYIN_API_BASE_URL=http://douyin-api:5000
+      # 抖音登录 Cookie（未配置时只能抓到约40条最近视频）
+      - DOUYIN_COOKIE=${DOUYIN_COOKIE:-}
+      # 视频处理总并发上限
+      - MAX_CONCURRENT_VIDEOS=${MAX_CONCURRENT_VIDEOS:-1000}
       # Dify API 地址（用户需要配置 Dify 后填写）
       - DIFY_API_BASE_URL=http://host.docker.internal:8080
       - DIFY_API_KEY=${DIFY_API_KEY:-}

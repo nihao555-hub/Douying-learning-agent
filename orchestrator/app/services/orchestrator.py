@@ -1,6 +1,6 @@
 """
 核心编排服务
-完整流程：添加博主 → 爬取视频列表 → 下载视频 → 提取音频 → 语音转文字 → AI解析总结 → 生成综合大文档
+完整流程：添加博主 → 爬取视频列表 → 并发下载/转写/AI深度解析 → 生成综合大文档
 """
 import os
 import asyncio
@@ -32,6 +32,10 @@ class Orchestrator:
         self.transcript_dir = Path(settings.TRANSCRIPT_STORAGE_PATH)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 总并发上限（默认 1000）
+        self.max_concurrency = max(1, int(getattr(settings, "MAX_CONCURRENT_VIDEOS", 1000) or 1000))
+        self._progress_lock = asyncio.Lock()
     
     async def add_blogger(self, db: AsyncSession, url: str) -> Optional[Blogger]:
         """添加博主并开始处理"""
@@ -93,6 +97,46 @@ class Orchestrator:
         async with async_session() as own_db:
             return await self._process_blogger_impl(own_db, blogger_id, source_url)
     
+    async def _update_blogger_progress(
+        self,
+        blogger_id: int,
+        *,
+        stage: str = None,
+        status: str = None,
+        progress: int = None,
+        current_index: int = None,
+        processed: int = None,
+        total: int = None,
+        error_message: str = None,
+    ):
+        """并发安全地更新博主进度（独立 session + 锁）"""
+        async with self._progress_lock:
+            try:
+                async with async_session() as progress_db:
+                    result = await progress_db.execute(
+                        select(Blogger).where(Blogger.id == blogger_id)
+                    )
+                    b = result.scalar_one_or_none()
+                    if not b:
+                        return
+                    if stage is not None:
+                        b.current_stage = stage
+                    if status is not None:
+                        b.status = status
+                    if progress is not None:
+                        b.progress = progress
+                    if current_index is not None:
+                        b.current_video_index = current_index
+                    if processed is not None:
+                        b.processed_videos = processed
+                    if total is not None:
+                        b.total_videos = total
+                    if error_message is not None:
+                        b.error_message = error_message
+                    await progress_db.commit()
+            except Exception as e:
+                logger.debug(f"更新博主进度失败: {e}")
+    
     async def _process_blogger_impl(self, db: AsyncSession, blogger_id: int, source_url: str = "") -> bool:
         """完整处理博主实现"""
         try:
@@ -119,22 +163,15 @@ class Orchestrator:
             if blogger.sec_user_id and "/user/" not in user_url and "/video/" not in user_url:
                 user_url = f"https://www.douyin.com/user/{blogger.sec_user_id}"
             
-            # 爬取进度回调：实时更新数据库中的阶段和数量（使用独立session避免冲突）
+            # 爬取进度回调：实时更新数据库中的阶段和数量
             async def on_crawl_progress(count: int, stage_text: str):
-                try:
-                    async with async_session() as progress_db:
-                        result = await progress_db.execute(
-                            select(Blogger).where(Blogger.id == blogger_id)
-                        )
-                        b = result.scalar_one_or_none()
-                        if b:
-                            b.current_stage = stage_text
-                            b.total_videos = count
-                            b.progress = min(int(count / max(count + 1, 10) * 20), 19) if count > 0 else 1
-                            await progress_db.commit()
-                            logger.info(f"[进度更新] {stage_text}")
-                except Exception as e:
-                    logger.debug(f"更新爬取进度失败: {e}")
+                await self._update_blogger_progress(
+                    blogger_id,
+                    stage=stage_text,
+                    total=count,
+                    progress=min(int(count / max(count + 1, 10) * 20), 19) if count > 0 else 1,
+                )
+                logger.info(f"[进度更新] {stage_text}")
             
             videos_info = await self.douyin.get_user_videos(
                 user_url,
@@ -147,77 +184,149 @@ class Orchestrator:
                 logger.warning("未获取到视频列表，尝试作为单个视频处理")
                 blogger.status = "failed"
                 blogger.current_stage = "爬取失败"
-                blogger.error_message = "无法获取视频列表，可能是反爬限制。请尝试直接分享视频链接。"
+                blogger.error_message = (
+                    "无法获取视频列表。若博主作品较多，请配置 DOUYIN_COOKIE（登录态）后重试。"
+                )
                 await db.commit()
                 return False
             
             logger.info(f"爬取到 {len(videos_info)} 个视频")
+            expected = blogger.aweme_count or 0
+            if expected and len(videos_info) < expected:
+                logger.warning(
+                    f"爬取数量({len(videos_info)})少于博主作品数({expected})，"
+                    "可能因未登录 Cookie 被截断。请配置 DOUYIN_COOKIE。"
+                )
+            
             blogger.total_videos = len(videos_info)
-            blogger.current_stage = f"准备处理 {len(videos_info)} 个视频..."
+            blogger.current_stage = f"准备并发处理 {len(videos_info)} 个视频 (并发={self.max_concurrency})..."
             blogger.progress = 20
+            blogger.status = "downloading"
             await db.commit()
             
-            # 2. 逐个处理视频
-            video_objects = []
+            # 2. 并发处理视频（Semaphore 限制最大并发）
             total_videos = len(videos_info)
-            for i, v_info in enumerate(videos_info):
-                video_num = i + 1
-                short_title = v_info['title'][:40]
-                logger.info(f"--- 处理视频 {video_num}/{total_videos}: {short_title}... ---")
+            sem = asyncio.Semaphore(self.max_concurrency)
+            completed_count = 0
+            success_ids: List[int] = []
+            count_lock = asyncio.Lock()
+            
+            async def process_one(index: int, v_info: dict) -> Optional[int]:
+                """处理单个视频，返回成功的 video.id"""
+                nonlocal completed_count
+                video_num = index + 1
+                short_title = (v_info.get("title") or "")[:40]
                 
-                blogger.current_video_index = video_num
-                blogger.current_stage = f"[{video_num}/{total_videos}] 下载视频: {short_title}..."
-                blogger.status = "downloading"
-                blogger.progress = int(20 + (video_num - 1) / max(total_videos, 1) * 70)
-                await db.commit()
-                
-                video = Video(
-                    blogger_id=blogger.id,
-                    aweme_id=v_info["aweme_id"],
-                    title=v_info["title"],
-                    desc=v_info.get("desc", ""),
-                    cover_url=v_info.get("cover_url", ""),
-                    duration=v_info.get("duration", 0),
-                    digg_count=v_info.get("digg_count", 0),
-                    comment_count=v_info.get("comment_count", 0),
-                    share_count=v_info.get("share_count", 0),
-                    collect_count=v_info.get("collect_count", 0),
-                    create_time=v_info.get("create_time"),
-                    video_url=v_info.get("video_url", v_info.get("webpage_url", "")),
-                    status="pending"
+                async with sem:
+                    # 每个并发任务使用独立 DB session，避免 SQLite/会话冲突
+                    async with async_session() as task_db:
+                        try:
+                            await self._update_blogger_progress(
+                                blogger_id,
+                                stage=f"[{video_num}/{total_videos}] 处理中: {short_title}...",
+                                status="downloading",
+                                current_index=video_num,
+                            )
+                            
+                            video = Video(
+                                blogger_id=blogger_id,
+                                aweme_id=v_info["aweme_id"],
+                                title=v_info["title"],
+                                desc=v_info.get("desc", ""),
+                                cover_url=v_info.get("cover_url", ""),
+                                duration=v_info.get("duration", 0),
+                                digg_count=v_info.get("digg_count", 0),
+                                comment_count=v_info.get("comment_count", 0),
+                                share_count=v_info.get("share_count", 0),
+                                collect_count=v_info.get("collect_count", 0),
+                                create_time=v_info.get("create_time"),
+                                video_url=v_info.get("video_url", v_info.get("webpage_url", "")),
+                                status="pending"
+                            )
+                            task_db.add(video)
+                            await task_db.commit()
+                            await task_db.refresh(video)
+                            
+                            success = False
+                            for attempt in range(1, 4):
+                                if attempt > 1:
+                                    logger.info(f"  ↩️ 重试第{attempt}次: {video.title[:30]}...")
+                                    await asyncio.sleep(1.5 * attempt)
+                                
+                                success = await self._process_single_video(
+                                    task_db, video, None, video_num, total_videos
+                                )
+                                if success:
+                                    break
+                            
+                            async with count_lock:
+                                completed_count += 1
+                                done = completed_count
+                                prog = int(20 + done / max(total_videos, 1) * 70)
+                            
+                            await self._update_blogger_progress(
+                                blogger_id,
+                                processed=done,
+                                progress=prog,
+                                current_index=done,
+                                stage=(
+                                    f"[{done}/{total_videos}] "
+                                    + ("完成: " if success else "失败: ")
+                                    + short_title
+                                ),
+                            )
+                            
+                            if success:
+                                logger.info(f"✓ [{done}/{total_videos}] {short_title}")
+                                return video.id
+                            
+                            logger.error(f"✗ [{done}/{total_videos}] 3次重试仍失败: {short_title}")
+                            return None
+                        except Exception as e:
+                            logger.error(f"并发处理视频异常 {short_title}: {e}", exc_info=True)
+                            async with count_lock:
+                                completed_count += 1
+                            return None
+            
+            logger.info(
+                f"========== 开始并发处理 {total_videos} 个视频 "
+                f"(max_concurrency={self.max_concurrency}) =========="
+            )
+            results = await asyncio.gather(
+                *[process_one(i, v) for i, v in enumerate(videos_info)],
+                return_exceptions=True,
+            )
+            
+            for r in results:
+                if isinstance(r, int):
+                    success_ids.append(r)
+                elif isinstance(r, Exception):
+                    logger.error(f"并发任务异常: {r}")
+            
+            # 重新加载成功的视频对象供综合文档使用
+            video_objects: List[Video] = []
+            if success_ids:
+                result = await db.execute(
+                    select(Video).where(Video.id.in_(success_ids))
                 )
-                db.add(video)
-                await db.commit()
-                await db.refresh(video)
-                
-                # 处理单个视频（带重试机制，最多3次）
-                success = False
-                for attempt in range(1, 4):
-                    if attempt > 1:
-                        logger.info(f"  ↩️ 重试第{attempt}次: {video.title[:30]}...")
-                        blogger.current_stage = f"[{video_num}/{total_videos}] 重试({attempt}/3): {video.title[:30]}..."
-                        await db.commit()
-                        await asyncio.sleep(2)
-                    
-                    success = await self._process_single_video(db, video, blogger, video_num, total_videos)
-                    if success:
-                        break
-                    elif attempt < 3:
-                        logger.warning(f"  视频处理失败，准备第{attempt+1}次重试: {video.title[:30]}...")
-                
-                blogger.processed_videos = video_num
-                blogger.progress = int(20 + video_num / max(total_videos, 1) * 70)
-                await db.commit()
-                
-                if success:
-                    video_objects.append(video)
-                else:
-                    logger.error(f"  视频经过3次重试仍失败: {video.title[:30]}...")
+                video_objects = list(result.scalars().all())
+            
+            logger.info(
+                f"并发处理完成: 成功 {len(video_objects)}/{total_videos}"
+            )
             
             # 3. 生成综合大文档
+            blogger = (await db.execute(
+                select(Blogger).where(Blogger.id == blogger_id)
+            )).scalar_one_or_none()
+            if not blogger:
+                return False
+            
             blogger.status = "summarizing"
             blogger.current_stage = "正在生成综合知识文档..."
             blogger.progress = 90
+            blogger.processed_videos = len(video_objects)
+            blogger.total_videos = total_videos
             await db.commit()
             
             logger.info("========== 生成综合大文档 ==========")
@@ -243,15 +352,22 @@ class Orchestrator:
                     blogger.status = "failed"
                     blogger.error_message = str(e)
                     await db.commit()
-            except:
+            except Exception:
                 pass
             return False
     
-    async def _process_single_video(self, db: AsyncSession, video: Video, blogger: Blogger = None, video_num: int = 0, total: int = 0) -> bool:
-        """处理单个视频：下载 → 提取音频 → ASR → AI总结（含重试时的状态重置）"""
+    async def _process_single_video(
+        self,
+        db: AsyncSession,
+        video: Video,
+        blogger: Blogger = None,
+        video_num: int = 0,
+        total: int = 0,
+    ) -> bool:
+        """处理单个视频：下载 → 提取音频 → ASR → AI完整深度解析（含重试时的状态重置）"""
         try:
             def update_stage(stage_text):
-                """更新当前处理阶段"""
+                """更新当前处理阶段（串行模式；并发模式由外层进度回调负责）"""
                 if blogger and video_num and total:
                     blogger.current_stage = f"[{video_num}/{total}] {stage_text}"
             
@@ -264,7 +380,6 @@ class Orchestrator:
             # 1. 下载视频
             video_path = None
             if video.local_video_path:
-                # 已下载过的直接复用
                 from pathlib import Path
                 if Path(video.local_video_path).exists():
                     video_path = video.local_video_path
@@ -317,31 +432,44 @@ class Orchestrator:
             transcript_path = self.transcript_dir / f"{video.aweme_id}.txt"
             transcript_path.write_text(transcript, encoding='utf-8')
             
-            # 3. AI深度解析总结
+            # 3. AI 完整深度解析（不是摘要）
             video.status = "summarizing"
-            update_stage("AI 分析总结内容...")
+            update_stage("AI 完整深度解析...")
             await db.commit()
             
             analysis = await self.gemini.analyze_video(video.title, transcript)
             
             if not analysis:
                 video.status = "failed"
-                video.error_message = "AI总结返回空结果"
+                video.error_message = "AI解析返回空结果"
                 await db.commit()
                 return False
             
-            # 保存详细解析和摘要（详细解析在前，摘要在后）
-            detailed = analysis.get("detailed_analysis", "")
-            summary = analysis.get("summary", "")
-            # 合并：详细解析 + 简短摘要，摘要放最后
-            video.summary = f"{detailed}\n\n---\n\n**摘要**：{summary}" if detailed and summary else (detailed or summary)
+            # 保存完整深度解析：detailed_analysis 为主体，summary 仅作文末短摘要
+            detailed = (analysis.get("detailed_analysis") or "").strip()
+            summary = (analysis.get("summary") or "").strip()
+            
+            # 若模型把全文塞进 summary，则提升为详细解析
+            if not detailed and summary and len(summary) > 500:
+                detailed = summary
+                summary = summary[:300] + "..."
+            
+            if detailed and summary:
+                video.summary = f"{detailed}\n\n---\n\n**摘要**：{summary}"
+            else:
+                video.summary = detailed or summary
+            
+            if not video.summary or len(video.summary) < 200:
+                logger.warning(
+                    f"解析结果过短({len(video.summary or '')}字)，可能不是完整深度解析: {video.title[:30]}"
+                )
             
             key_points = analysis.get("key_points", [])
             if isinstance(key_points, str):
                 import json
                 try:
                     key_points = json.loads(key_points)
-                except:
+                except Exception:
                     key_points = [key_points]
             video.key_points = key_points if isinstance(key_points, list) else []
             
@@ -350,7 +478,7 @@ class Orchestrator:
                 import json
                 try:
                     topics = json.loads(topics)
-                except:
+                except Exception:
                     topics = [topics]
             video.topics = topics if isinstance(topics, list) else []
             
@@ -373,7 +501,10 @@ class Orchestrator:
                 logger.warning(f"添加到知识库失败: {e}")
             
             await db.commit()
-            logger.info(f"视频处理完成: {video.title[:30]}")
+            logger.info(
+                f"视频完整解析完成: {video.title[:30]}... "
+                f"(解析长度={len(video.summary or '')}字)"
+            )
             return True
             
         except Exception as e:
@@ -438,7 +569,8 @@ class Orchestrator:
                 if v.summary:
                     video_summaries.append({
                         "title": v.title,
-                        "summary": v.summary[:2000],  # 限制每个视频输入长度，确保所有视频都能传入
+                        # 传入更完整的深度解析，避免综合文档只看到摘要
+                        "summary": v.summary[:4000],
                         "key_points": v.key_points or [],
                         "topics": v.topics or []
                     })

@@ -62,43 +62,51 @@ class GeminiClient:
     
     async def analyze_video(self, title: str, transcript: str) -> Optional[Dict]:
         """
-        深度解析单个视频内容
+        完整深度解析单个视频内容（不是摘要！）
         
         返回结构：
         {
-            "summary": "结构化总结（Markdown格式）",
+            "detailed_analysis": "完整深度解析正文（主体，1500-4000字）",
+            "summary": "文末短摘要（150-300字）",
             "key_points": ["要点1", "要点2", ...],
             "topics": ["主题1", "主题2", ...],
             "takeaways": "金句和可操作建议",
             "outline": ["大纲1", "大纲2", ...]
         }
         """
-        system_prompt = """你是一个专业的短视频内容深度分析师。请对给定的视频内容进行全面、深度的解析，输出JSON格式（不要输出任何其他内容，只输出JSON）。
+        # 保留尽可能完整的文稿，避免截断导致解析变浅
+        full_transcript = transcript or ""
+        if len(full_transcript) > 50000:
+            full_transcript = full_transcript[:50000] + "\n...(文稿过长已截断)"
+        
+        system_prompt = """你是专业的短视频内容完整深度解析专家。你的任务是产出「完整视频解析」，绝不是短摘要。
 
-JSON结构如下：
+【硬性要求】
+1. detailed_analysis 是唯一主体，必须是完整深度解析，禁止只写摘要、禁止空泛套话
+2. detailed_analysis 长度必须 1500-4000 字（中文），覆盖文稿中几乎所有有效信息点
+3. 必须逐段/逐观点展开：引用或转述原文关键表述，再解释含义、原因、适用场景、注意事项
+4. 若文稿较短，也要结合标题与上下文做充分阐释，而不是敷衍成几百字摘要
+5. summary 只是文末附属短摘要（150-300字），绝不能替代 detailed_analysis
+6. 只输出 JSON，不要输出任何其他文字
+
+JSON结构：
 {
-  "detailed_analysis": "详细的深度解析内容，用Markdown格式，包含以下部分：\n### 一、内容概述\n简要说明视频讲了什么\n### 二、核心观点深度剖析\n逐条分析视频中的每个重要观点，展开论述\n### 三、背景与上下文\n补充相关的背景知识、行业背景或剧情背景\n### 四、方法论与实操步骤\n提取视频中提到的方法、步骤、技巧\n### 五、关键细节\n容易被忽略但重要的细节\n长度1000-2000字，要有深度有细节",
-  "key_points": ["核心要点1（详细描述）", "核心要点2（详细描述）", ...],
-  "topics": ["视频涉及的主题分类"],
-  "takeaways": "金句摘录和可以直接执行的操作建议，用Markdown列表格式",
-  "outline": ["内容大纲1", "内容大纲2", ...],
-  "summary": "最后输出的简短摘要，150-300字，概括视频精华"
+  "detailed_analysis": "Markdown完整深度解析，必须包含以下章节：\n### 一、内容概述\n（视频讲了什么、目标受众、核心命题）\n### 二、完整内容梳理\n（按文稿逻辑顺序，把视频内容完整重述+解释，不可跳过大段有效信息）\n### 三、核心观点深度剖析\n（每条观点：原文要点 → 深入解释 → 为什么重要 → 实例/推论）\n### 四、背景与上下文\n（行业/知识/剧情背景补充）\n### 五、方法论与实操步骤\n（可执行步骤、技巧、清单）\n### 六、关键细节与隐含信息\n（容易忽略但重要的细节）\n### 七、批判性思考与延伸\n（局限、适用边界、可延伸问题）",
+  "key_points": ["核心要点1（30-80字详细描述）", "核心要点2", "...共5-12条"],
+  "topics": ["从下列分类选择: 账号定位/内容创作/拍摄技巧/算法流量/粉丝运营/变现方法/个人成长/情感关系/知识科普/影视解说/其他"],
+  "takeaways": "金句摘录 + 可直接执行建议，Markdown列表",
+  "outline": ["内容大纲条目..."],
+  "summary": "文末短摘要，150-300字，概括精华（不能替代detailed_analysis）"
 }
 
-要求：
-1. detailed_analysis 是最重要的部分，必须详实、有深度，不是简单罗列而是深入分析
-2. key_points 提取5-10个核心观点，每个要点要详细描述（20-50字）
-3. topics 从固定分类中选择：账号定位、内容创作、拍摄技巧、算法流量、粉丝运营、变现方法、个人成长、情感关系、知识科普、影视解说、其他
-4. takeaways 要实用，是观众看完就能用的东西
-5. summary 放在最后，是精炼的短摘要
-6. 所有内容用中文"""
+全部内容使用中文。"""
 
         user_prompt = f"""视频标题：{title}
 
-视频文字稿：
-{transcript}
+完整视频文字稿（请基于全文做完整解析，不要只提炼摘要）：
+{full_transcript}
 
-请对这个视频进行全面深度解析，注意detailed_analysis部分要详实有深度，summary放在最后。输出JSON。"""
+请输出完整深度解析JSON。再次强调：detailed_analysis 必须详实完整（1500字以上），summary 仅作短摘要放在字段末尾。"""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -121,12 +129,17 @@ JSON结构如下：
                 result = result.strip()
             
             data = json.loads(result)
+            # 兜底：确保 detailed_analysis 存在
+            if not data.get("detailed_analysis") and data.get("summary"):
+                # 若只有 summary，将其视为解析正文
+                data["detailed_analysis"] = data["summary"]
             return data
         except json.JSONDecodeError as e:
             logger.error(f"解析视频分析JSON失败: {e}, 内容: {result[:200]}")
-            # 返回原始文本作为总结
+            # 返回原始文本作为完整解析正文（而非短摘要）
             return {
-                "summary": result,
+                "detailed_analysis": result,
+                "summary": result[:300] if len(result) > 300 else result,
                 "key_points": [],
                 "topics": [],
                 "takeaways": "",
@@ -154,19 +167,17 @@ JSON结构如下：
             "key_insights": ["核心洞察1", "核心洞察2", ...]
         }
         """
-        # 准备所有视频摘要 - 根据视频数量动态调整每个视频的输入长度
+        # 准备所有视频的深度解析 - 动态分配长度，优先保留完整解析而非短摘要
         num_videos = len(video_summaries)
-        # 动态计算每个视频的最大输入字符数，确保总输入不超过50000字符
-        per_video_limit = min(800, max(200, 50000 // max(num_videos, 1)))
+        # 总输入约 80000 字符，尽量多保留每个视频的详细解析
+        per_video_limit = min(3500, max(600, 80000 // max(num_videos, 1)))
         
         videos_text = ""
         for i, v in enumerate(video_summaries, 1):
             videos_text += f"\n\n### 视频{i}：{v.get('title', '未知标题')}\n"
-            # 核心要点最多取3条，每条限制50字
-            kp = v.get('key_points', [])[:3]
-            videos_text += f"**核心要点**：{'; '.join(str(k)[:50] for k in kp)}\n"
-            # 内容摘要根据视频数量动态限制
-            videos_text += f"**内容摘要**：{v.get('summary', '')[:per_video_limit]}\n"
+            kp = v.get('key_points', [])[:8]
+            videos_text += f"**核心要点**：{'; '.join(str(k)[:80] for k in kp)}\n"
+            videos_text += f"**完整解析**：{v.get('summary', '')[:per_video_limit]}\n"
         
         system_prompt = f"""你是一个顶级的知识架构师和内容分析师。现在你需要分析抖音博主「{blogger_name}」的所有视频内容，为他构建一份完整、详尽的知识体系大文档。
 
