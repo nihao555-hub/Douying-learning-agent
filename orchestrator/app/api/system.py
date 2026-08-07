@@ -1,12 +1,16 @@
 """
-系统状态 API - 检查各服务连接状态
+系统状态 API - 检查各服务连接状态 / 质量检测
 """
-from fastapi import APIRouter, Depends
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.services.douyin_client import get_douyin_client
 from app.services.dify_client import get_dify_client
+from app.services.quality_audit import run_quality_audit
 from app.core.config import settings
+from pathlib import Path
 
 router = APIRouter(prefix="/api/system", tags=["系统状态"])
 
@@ -42,8 +46,13 @@ async def system_status():
     except Exception as e:
         status["dify"] = f"error: {str(e)[:50]}"
     
-    # ASR 模型状态（懒加载，未加载时显示 not_loaded）
-    status["asr_model"] = f"{settings.ASR_ENGINE} ({settings.WHISPER_MODEL_SIZE}) - not_loaded"
+    # ASR 模型：检查本地模型文件是否就绪
+    model_path = getattr(settings, "WHISPER_MODEL_PATH", "") or "./data/models/faster-whisper-base"
+    model_ok = Path(model_path).exists() and (Path(model_path) / "model.bin").exists()
+    status["asr_model"] = (
+        f"{settings.ASR_ENGINE} ({settings.WHISPER_MODEL_SIZE}) - "
+        + ("ready" if model_ok else "model_missing")
+    )
     
     return status
 
@@ -63,4 +72,24 @@ async def get_config():
         "whisper_device": settings.WHISPER_DEVICE,
         "max_videos_per_blogger": settings.MAX_VIDEOS_PER_BLOGGER,
         "max_concurrent_videos": getattr(settings, "MAX_CONCURRENT_VIDEOS", 1000),
+        "video_slice_seconds": getattr(settings, "VIDEO_SLICE_SECONDS", 120),
+        "full_video_pipeline": True,
+        "no_frame_extraction": True,
     }
+
+
+@router.get("/quality-audit")
+async def quality_audit(
+    blogger_id: Optional[int] = Query(None, description="仅审计指定博主；默认全部"),
+    persist: bool = Query(False, description="是否把重算后的验收写入数据库"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    完整质量检测：
+    - 基础设施（Gemini / Whisper / ffmpeg / 并发配置 / Cookie）
+    - 抓取覆盖（crawled vs aweme_count）
+    - 素材完整性（完整视频/音频）
+    - 学习验收重算（切片 ASR 流水线，无抽帧；口播稀少单独计分）
+    - 综合文档
+    """
+    return await run_quality_audit(db, blogger_id=blogger_id, persist_reeval=persist)

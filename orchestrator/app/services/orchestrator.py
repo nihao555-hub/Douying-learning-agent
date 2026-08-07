@@ -441,13 +441,14 @@ class Orchestrator:
             summary = (analysis.get("summary") or "").strip()
             quality = video.quality_report or {}
             
+            sparse = "口播稀少；" if quality.get("speech_sparse") else ""
             quality_block = (
                 f"\n\n---\n\n**学习验收**：得分 {quality.get('score', 0)} / "
-                f"{'通过' if quality.get('passed') else '未通过'}；"
+                f"{'通过' if quality.get('passed') else '未通过'}；{sparse}"
                 f"转写{quality.get('transcript_chars', 0)}字；"
                 f"解析{quality.get('analysis_chars', 0)}字；"
                 f"卡片{quality.get('knowledge_cards', 0)}张；"
-                f"关键帧{quality.get('frames_analyzed', 0)}；"
+                f"切片流水线（无抽帧）；"
                 f"问题：{', '.join(quality.get('issues') or []) or '无'}"
             )
             

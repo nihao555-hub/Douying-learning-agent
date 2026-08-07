@@ -107,8 +107,8 @@ class GeminiClient:
     ) -> Optional[Dict]:
         """
         完整深度解析（六层中的结构化解析）
-        输入是「带时间戳文稿 + 关键帧OCR/画面笔记」，不是直接整段上传大视频文件。
-        原因：大视频直接喂给 LLM 成本高/易超时；完整学习应先 ASR+关键帧，再结构化。
+        输入是「带时间戳完整文稿/描述」，不是直接整段上传大视频文件。
+        大视频先完整下载并切片 ASR，再结构化解析；不抽帧。
         """
         full_transcript = timed_transcript or desc or ""
         if len(full_transcript) > 60000:
@@ -119,14 +119,14 @@ class GeminiClient:
 
 【硬性要求】
 1. detailed_analysis 必须是完整深度解析（{length_req}），禁止只写摘要
-2. 结合「带时间戳口播文稿」与「关键帧OCR/画面笔记」，补全只出现在画面上的知识
-3. 引用时间戳，如 [01:23]
-4. 必须产出 knowledge_cards（知识原子卡片），每张卡尽量带 timestamp
-5. 只输出 JSON
+2. 以「带时间戳完整文稿/描述」为主；无口播时仍需基于标题、描述与内容语境做深度结构化解析
+3. 有时间戳则引用，如 [01:23]
+4. 必须产出 knowledge_cards（知识原子卡片）至少 5 张，尽量带 timestamp
+5. 只输出 JSON（不要抽帧、不要依赖画面截图）
 
 JSON结构：
 {{
-  "detailed_analysis": "Markdown完整解析，含：\\n### 一、内容概述\\n### 二、完整内容梳理（按时间线）\\n### 三、核心观点深度剖析\\n### 四、方法论与实操步骤\\n### 五、术语表\\n### 六、前提假设与适用边界\\n### 七、关键画面/板书知识\\n### 八、金句与可执行动作\\n### 九、批判性思考",
+  "detailed_analysis": "Markdown完整解析，含：\\n### 一、内容概述\\n### 二、完整内容梳理（按时间线）\\n### 三、核心观点深度剖析\\n### 四、方法论与实操步骤\\n### 五、术语表\\n### 六、前提假设与适用边界\\n### 七、创作手法/表达技巧\\n### 八、金句与可执行动作\\n### 九、批判性思考",
   "key_points": ["要点..."],
   "topics": ["主题分类"],
   "takeaways": "金句+可执行建议 Markdown 列表",
@@ -138,7 +138,7 @@ JSON结构：
       "content": "卡片正文",
       "timestamp": "mm:ss",
       "time_range": "mm:ss-mm:ss",
-      "source": "speech|screen|both"
+      "source": "speech|desc|both"
     }}
   ],
   "summary": "150-300字短摘要（附属，不能替代 detailed_analysis）"
@@ -148,11 +148,10 @@ JSON结构：
 
 视频描述：{desc or '无'}
 
-带时间戳口播文稿：
+带时间戳完整文稿（口播稀少时可主要依据标题与描述）：
 {full_transcript or '（无口播文稿）'}
 
-关键帧画面/OCR笔记：
-{vision_notes or '（无画面笔记）'}
+补充说明：{vision_notes or '无抽帧；请基于文稿与描述完成完整学习解析。'}
 
 请输出完整知识学习 JSON。"""
 
