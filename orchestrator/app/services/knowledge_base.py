@@ -5,11 +5,19 @@
 """
 import os
 import hashlib
-import numpy as np
 from typing import List, Dict, Optional
-import chromadb
 from app.core.config import settings
 from app.core.logger import logger
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
+
+try:
+    import chromadb
+except ImportError:  # pragma: no cover
+    chromadb = None
 
 
 class SimpleEmbedding:
@@ -22,6 +30,18 @@ class SimpleEmbedding:
         results = []
         for text in input:
             # 使用简单的hash-based embedding
+            if np is None:
+                vector = [0.0] * self.dim
+                words = text.replace('\n', ' ').split()
+                for i, word in enumerate(words[:200]):
+                    h = int(hashlib.md5(word.encode('utf-8')).hexdigest(), 16)
+                    idx = h % self.dim
+                    vector[idx] += 1.0 / (i + 1)
+                norm = sum(x * x for x in vector) ** 0.5
+                if norm > 0:
+                    vector = [x / norm for x in vector]
+                results.append(vector)
+                continue
             vector = np.zeros(self.dim, dtype=np.float32)
             words = text.replace('\n', ' ').split()
             for i, word in enumerate(words[:200]):
@@ -37,34 +57,53 @@ class SimpleEmbedding:
 
 
 class KnowledgeBaseService:
-    """本地向量知识库服务"""
+    """本地向量知识库服务（ChromaDB 不可用时降级为空实现，不阻塞主流程）"""
     
     def __init__(self):
         self.persist_dir = os.path.join(settings.KB_STORAGE_PATH, "chroma")
         os.makedirs(self.persist_dir, exist_ok=True)
-        
-        self.client = chromadb.PersistentClient(path=self.persist_dir)
-        
-        # 使用简单embedding，无需下载模型
         self.embedding_fn = SimpleEmbedding()
+        self.client = None
+        self.available = False
         
-        logger.info(f"向量知识库初始化完成，存储路径: {self.persist_dir}")
+        if chromadb is None:
+            logger.warning("ChromaDB 未安装，知识库检索降级为不可用（不影响爬取/解析主流程）")
+            return
+        
+        try:
+            self.client = chromadb.PersistentClient(path=self.persist_dir)
+            self.available = True
+            logger.info(f"向量知识库初始化完成，存储路径: {self.persist_dir}")
+        except Exception as e:
+            logger.warning(f"向量知识库初始化失败，已降级: {e}")
     
     def _get_collection(self, blogger_id: int):
         """获取或创建博主对应的 collection"""
+        if not self.available or self.client is None:
+            return None
         collection_name = f"blogger_{blogger_id}"
         try:
-            collection = self.client.get_collection(
-                name=collection_name,
-                embedding_function=self.embedding_fn
-            )
-        except Exception:
-            collection = self.client.create_collection(
-                name=collection_name,
-                embedding_function=self.embedding_fn,
-                metadata={"blogger_id": blogger_id}
-            )
-        return collection
+            # chroma 新版本推荐 get_or_create，避免并发 create 冲突
+            if hasattr(self.client, "get_or_create_collection"):
+                return self.client.get_or_create_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_fn,
+                    metadata={"blogger_id": blogger_id},
+                )
+            try:
+                return self.client.get_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_fn,
+                )
+            except Exception:
+                return self.client.create_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_fn,
+                    metadata={"blogger_id": blogger_id},
+                )
+        except Exception as e:
+            logger.warning(f"获取 collection 失败: {e}")
+            return None
     
     async def add_video_document(
         self,
@@ -75,6 +114,8 @@ class KnowledgeBaseService:
         summary: str = ""
     ) -> bool:
         """添加视频文档（异步包装）"""
+        if not self.available:
+            return True
         import asyncio
         full_content = f"# {title}\n\n## 摘要\n{summary}\n\n## 全文\n{content}" if summary else content
         aweme_id = f"video_{video_id}"
@@ -100,8 +141,12 @@ class KnowledgeBaseService:
         content: str,
         metadata: Dict = None
     ) -> bool:
+        if not self.available:
+            return True
         try:
             collection = self._get_collection(blogger_id)
+            if collection is None:
+                return True
             paragraphs = self._split_text(content, max_length=500)
             
             if not paragraphs:
@@ -140,14 +185,65 @@ class KnowledgeBaseService:
             logger.warning(f"添加文档失败（不影响主流程）: {e}")
             return True
     
+    async def add_knowledge_cards(
+        self,
+        blogger_id: int,
+        video_id: int,
+        title: str,
+        cards: List[Dict],
+    ) -> bool:
+        """将知识原子卡片写入向量库（带时间戳元数据，便于追问定位）"""
+        if not self.available or not cards:
+            return True
+        import asyncio
+
+        def _add():
+            collection = self._get_collection(blogger_id)
+            if collection is None:
+                return True
+            ids, documents, metadatas = [], [], []
+            for i, card in enumerate(cards[:40]):
+                if not isinstance(card, dict):
+                    continue
+                ctitle = str(card.get("title") or f"卡片{i+1}")
+                content = str(card.get("content") or "")
+                ts = str(card.get("timestamp") or card.get("time_range") or "")
+                ctype = str(card.get("type") or "concept")
+                doc = f"【{ctype}】{ctitle}\n时间: {ts}\n{content}\n来源视频: {title}"
+                ids.append(f"card_{video_id}_{i}")
+                documents.append(doc)
+                metadatas.append({
+                    "video_id": video_id,
+                    "aweme_id": f"video_{video_id}",
+                    "title": title,
+                    "card_type": ctype,
+                    "timestamp": ts,
+                    "source": "knowledge_card",
+                })
+            if not ids:
+                return True
+            collection.add(ids=ids, documents=documents, metadatas=metadatas)
+            logger.info(f"知识卡片入库 {len(ids)} 张 (video_id={video_id})")
+            return True
+
+        try:
+            return await asyncio.to_thread(_add)
+        except Exception as e:
+            logger.warning(f"知识卡片入库失败: {e}")
+            return True
+
     def search(
         self,
         blogger_id: int,
         query: str,
         top_k: int = 5
     ) -> List[Dict]:
+        if not self.available:
+            return []
         try:
             collection = self._get_collection(blogger_id)
+            if collection is None:
+                return []
             
             results = collection.query(
                 query_texts=[query],

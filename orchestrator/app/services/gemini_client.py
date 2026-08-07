@@ -33,9 +33,10 @@ class GeminiClient:
         self,
         messages: List[Dict],
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> Optional[str]:
-        """非流式对话（不限制token输出）"""
+        """非流式对话（不限制token输出）。支持多模态 content 数组。"""
         try:
             url = f"{self.base_url}/v1/chat/completions"
             
@@ -45,10 +46,16 @@ class GeminiClient:
                 "temperature": temperature,
                 "stream": False
             }
-            # 不设置max_tokens，让API自动返回最大长度
             
-            response = await self.client.post(url, json=payload)
-            data = response.json()
+            client = self.client
+            if timeout:
+                client = httpx.AsyncClient(headers=self.headers, timeout=timeout)
+            try:
+                response = await client.post(url, json=payload)
+                data = response.json()
+            finally:
+                if timeout:
+                    await client.aclose()
             
             if "choices" in data and len(data["choices"]) > 0:
                 return data["choices"][0]["message"]["content"]
@@ -60,78 +67,286 @@ class GeminiClient:
             logger.error(f"Gemini API 异常: {e}")
             return None
     
-    async def analyze_video(self, title: str, transcript: str) -> Optional[Dict]:
-        """
-        深度解析单个视频内容
-        
-        返回结构：
-        {
-            "summary": "结构化总结（Markdown格式）",
-            "key_points": ["要点1", "要点2", ...],
-            "topics": ["主题1", "主题2", ...],
-            "takeaways": "金句和可操作建议",
-            "outline": ["大纲1", "大纲2", ...]
-        }
-        """
-        system_prompt = """你是一个专业的短视频内容深度分析师。请对给定的视频内容进行全面、深度的解析，输出JSON格式（不要输出任何其他内容，只输出JSON）。
-
-JSON结构如下：
-{
-  "detailed_analysis": "详细的深度解析内容，用Markdown格式，包含以下部分：\n### 一、内容概述\n简要说明视频讲了什么\n### 二、核心观点深度剖析\n逐条分析视频中的每个重要观点，展开论述\n### 三、背景与上下文\n补充相关的背景知识、行业背景或剧情背景\n### 四、方法论与实操步骤\n提取视频中提到的方法、步骤、技巧\n### 五、关键细节\n容易被忽略但重要的细节\n长度1000-2000字，要有深度有细节",
-  "key_points": ["核心要点1（详细描述）", "核心要点2（详细描述）", ...],
-  "topics": ["视频涉及的主题分类"],
-  "takeaways": "金句摘录和可以直接执行的操作建议，用Markdown列表格式",
-  "outline": ["内容大纲1", "内容大纲2", ...],
-  "summary": "最后输出的简短摘要，150-300字，概括视频精华"
-}
-
-要求：
-1. detailed_analysis 是最重要的部分，必须详实、有深度，不是简单罗列而是深入分析
-2. key_points 提取5-10个核心观点，每个要点要详细描述（20-50字）
-3. topics 从固定分类中选择：账号定位、内容创作、拍摄技巧、算法流量、粉丝运营、变现方法、个人成长、情感关系、知识科普、影视解说、其他
-4. takeaways 要实用，是观众看完就能用的东西
-5. summary 放在最后，是精炼的短摘要
-6. 所有内容用中文"""
-
-        user_prompt = f"""视频标题：{title}
-
-视频文字稿：
-{transcript}
-
-请对这个视频进行全面深度解析，注意detailed_analysis部分要详实有深度，summary放在最后。输出JSON。"""
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        
-        result = await self.chat(messages, temperature=0.3)
-        
+    def _parse_json_content(self, result: str) -> Optional[Dict]:
         if not result:
             return None
-        
-        # 尝试解析 JSON（处理可能的 markdown 代码块包裹）
         try:
-            # 去掉可能的 ```json ... ``` 包裹
             result = result.strip()
             if result.startswith("```"):
                 result = result.split("\n", 1)[1] if "\n" in result else result[3:]
                 if result.endswith("```"):
                     result = result[:-3]
                 result = result.strip()
-            
-            data = json.loads(result)
+            # 容错：截取首尾大括号
+            if not result.startswith("{"):
+                l = result.find("{")
+                r = result.rfind("}")
+                if l >= 0 and r > l:
+                    result = result[l : r + 1]
+            return json.loads(result)
+        except Exception as e:
+            logger.error(f"JSON解析失败: {e}, 内容: {(result or '')[:200]}")
+            return None
+
+    async def analyze_video(self, title: str, transcript: str) -> Optional[Dict]:
+        """兼容旧接口：转调完整解析"""
+        return await self.analyze_video_complete(
+            title=title,
+            timed_transcript=transcript or "",
+            vision_notes="",
+            desc="",
+        )
+
+    async def analyze_video_complete(
+        self,
+        title: str,
+        timed_transcript: str,
+        vision_notes: str = "",
+        desc: str = "",
+        partial: bool = False,
+    ) -> Optional[Dict]:
+        """
+        完整深度解析（六层中的结构化解析）
+        输入是「带时间戳完整文稿/描述」，不是直接整段上传大视频文件。
+        大视频先完整下载并切片 ASR，再结构化解析；不抽帧。
+        """
+        full_transcript = timed_transcript or desc or ""
+        if len(full_transcript) > 60000:
+            full_transcript = full_transcript[:60000] + "\n...(文稿过长已截断)"
+
+        length_req = "800-2000字" if partial else "1500-4000字"
+        system_prompt = f"""你是专业的短视频「完整知识学习」解析专家。目标是让学习者看完你的输出后，等于把视频知识学透，而不是只看摘要。
+
+【硬性要求】
+1. detailed_analysis 必须是完整深度解析（{length_req}），禁止只写摘要
+2. 以「带时间戳完整文稿/描述」为主；无口播时仍需基于标题、描述与内容语境做深度结构化解析
+3. 有时间戳则引用，如 [01:23]
+4. 必须产出 knowledge_cards（知识原子卡片）至少 5 张，尽量带 timestamp
+5. 只输出 JSON（不要抽帧、不要依赖画面截图）
+
+JSON结构：
+{{
+  "detailed_analysis": "Markdown完整解析，含：\\n### 一、内容概述\\n### 二、完整内容梳理（按时间线）\\n### 三、核心观点深度剖析\\n### 四、方法论与实操步骤\\n### 五、术语表\\n### 六、前提假设与适用边界\\n### 七、创作手法/表达技巧\\n### 八、金句与可执行动作\\n### 九、批判性思考",
+  "key_points": ["要点..."],
+  "topics": ["主题分类"],
+  "takeaways": "金句+可执行建议 Markdown 列表",
+  "outline": ["大纲"],
+  "knowledge_cards": [
+    {{
+      "type": "concept|step|formula|case|pitfall|quote",
+      "title": "卡片标题",
+      "content": "卡片正文",
+      "timestamp": "mm:ss",
+      "time_range": "mm:ss-mm:ss",
+      "source": "speech|desc|both"
+    }}
+  ],
+  "summary": "150-300字短摘要（附属，不能替代 detailed_analysis）"
+}}"""
+
+        user_prompt = f"""视频标题：{title}
+
+视频描述：{desc or '无'}
+
+带时间戳完整文稿（口播稀少时可主要依据标题与描述）：
+{full_transcript or '（无口播文稿）'}
+
+补充说明：{vision_notes or '无抽帧；请基于文稿与描述完成完整学习解析。'}
+
+请输出完整知识学习 JSON。"""
+
+        result = await self.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.25,
+        )
+        data = self._parse_json_content(result or "")
+        if data:
+            if not data.get("detailed_analysis") and data.get("summary"):
+                data["detailed_analysis"] = data["summary"]
+            if not isinstance(data.get("knowledge_cards"), list):
+                data["knowledge_cards"] = []
             return data
-        except json.JSONDecodeError as e:
-            logger.error(f"解析视频分析JSON失败: {e}, 内容: {result[:200]}")
-            # 返回原始文本作为总结
+        if result:
             return {
-                "summary": result,
+                "detailed_analysis": result,
+                "summary": result[:300],
                 "key_points": [],
                 "topics": [],
                 "takeaways": "",
-                "outline": []
+                "outline": [],
+                "knowledge_cards": [],
             }
+        return None
+
+    async def synthesize_chunk_analyses(
+        self,
+        title: str,
+        chunk_analyses: List[Dict],
+        vision_notes: str = "",
+    ) -> Optional[Dict]:
+        """大视频：把分段解析综合成最终完整解析"""
+        if not chunk_analyses:
+            return None
+        if len(chunk_analyses) == 1:
+            return chunk_analyses[0]
+
+        parts = []
+        all_cards = []
+        for i, ch in enumerate(chunk_analyses, 1):
+            if not ch:
+                continue
+            parts.append(
+                f"## 分段{i}\n{(ch.get('detailed_analysis') or '')[:3500]}\n"
+                f"要点: {ch.get('key_points')}\n"
+            )
+            cards = ch.get("knowledge_cards") or []
+            if isinstance(cards, list):
+                all_cards.extend(cards)
+
+        system_prompt = """你是知识架构师。请把同一视频的多个分段深度解析，综合成一份无重复、按时间线完整的最终解析 JSON。
+保留并去重 knowledge_cards。只输出 JSON，结构与单段解析相同。"""
+        user_prompt = f"""视频标题：{title}
+
+画面笔记：
+{vision_notes or '无'}
+
+分段解析：
+{chr(10).join(parts)[:50000]}
+
+请输出最终综合 JSON。"""
+        result = await self.chat(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            temperature=0.2,
+        )
+        data = self._parse_json_content(result or "")
+        if data:
+            cards = data.get("knowledge_cards") or []
+            if not cards:
+                data["knowledge_cards"] = all_cards[:40]
+            return data
+        # 兜底拼接
+        merged = "\n\n".join(
+            (c.get("detailed_analysis") or "") for c in chunk_analyses if c
+        )
+        return {
+            "detailed_analysis": merged,
+            "summary": (chunk_analyses[0] or {}).get("summary", ""),
+            "key_points": sum((c.get("key_points") or [] for c in chunk_analyses if c), [])[:12],
+            "topics": (chunk_analyses[0] or {}).get("topics") or [],
+            "takeaways": "\n".join(
+                str((c or {}).get("takeaways") or "") for c in chunk_analyses
+            ),
+            "outline": sum((c.get("outline") or [] for c in chunk_analyses if c), [])[:20],
+            "knowledge_cards": all_cards[:40],
+        }
+
+    async def analyze_keyframes(self, title: str, frames: List[Dict]) -> List[Dict]:
+        """多模态关键帧分析：OCR + 画面知识。失败则返回空。"""
+        if not frames:
+            return []
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    f"视频标题：{title}\n"
+                    "请分析下列关键帧。对每一帧输出 OCR 文字、画面描述、屏上知识。"
+                    "只输出 JSON 数组："
+                    '[{"timestamp_label":"mm:ss","ocr_text":"...","description":"...","on_screen_knowledge":"..."}]'
+                ),
+            }
+        ]
+        for fr in frames:
+            label = fr.get("timestamp_label") or str(fr.get("timestamp") or "")
+            content.append({"type": "text", "text": f"关键帧时间 {label}"})
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{fr.get('mime', 'image/jpeg')};base64,{fr.get('b64', '')}"
+                    },
+                }
+            )
+
+        result = await self.chat(
+            [{"role": "user", "content": content}],
+            temperature=0.2,
+            timeout=90.0,
+        )
+        if not result:
+            return []
+        # 解析数组或对象
+        try:
+            text = result.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+            l, r = text.find("["), text.rfind("]")
+            if l >= 0 and r > l:
+                arr = json.loads(text[l : r + 1])
+                if isinstance(arr, list):
+                    # 回填 timestamp
+                    for i, item in enumerate(arr):
+                        if not item.get("timestamp_label") and i < len(frames):
+                            item["timestamp_label"] = frames[i].get("timestamp_label")
+                            item["timestamp"] = frames[i].get("timestamp")
+                    return arr
+        except Exception as e:
+            logger.warning(f"关键帧结果解析失败: {e}")
+        # 降级：把原始文本当作一帧描述
+        return [{
+            "timestamp_label": frames[0].get("timestamp_label"),
+            "timestamp": frames[0].get("timestamp"),
+            "ocr_text": "",
+            "description": (result or "")[:500],
+            "on_screen_knowledge": "",
+        }]
+
+    async def extract_knowledge_cards(
+        self,
+        title: str,
+        timed_transcript: str,
+        analysis: Dict,
+        vision_notes: str = "",
+    ) -> List[Dict]:
+        """单独抽取知识卡片（当主解析未带 cards 时）"""
+        system_prompt = """从视频学习材料中抽取可检索知识卡片。只输出 JSON 数组。
+每项: {"type":"concept|step|formula|case|pitfall|quote","title":"...","content":"...","timestamp":"mm:ss","time_range":"mm:ss-mm:ss","source":"speech|screen|both"}
+至少 5 张，最多 20 张。"""
+        user_prompt = f"""标题：{title}
+
+文稿：
+{(timed_transcript or '')[:12000]}
+
+解析：
+{(analysis.get('detailed_analysis') or '')[:8000]}
+
+画面笔记：
+{vision_notes or '无'}
+"""
+        result = await self.chat(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            temperature=0.2,
+        )
+        if not result:
+            return []
+        try:
+            text = result.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+                if text.endswith("```"):
+                    text = text[:-3]
+            l, r = text.find("["), text.rfind("]")
+            if l >= 0 and r > l:
+                arr = json.loads(text[l : r + 1])
+                return arr if isinstance(arr, list) else []
+        except Exception:
+            return []
+        return []
     
     async def generate_master_doc(
         self,
@@ -154,19 +369,17 @@ JSON结构如下：
             "key_insights": ["核心洞察1", "核心洞察2", ...]
         }
         """
-        # 准备所有视频摘要 - 根据视频数量动态调整每个视频的输入长度
+        # 准备所有视频的深度解析 - 动态分配长度，优先保留完整解析而非短摘要
         num_videos = len(video_summaries)
-        # 动态计算每个视频的最大输入字符数，确保总输入不超过50000字符
-        per_video_limit = min(800, max(200, 50000 // max(num_videos, 1)))
+        # 总输入约 80000 字符，尽量多保留每个视频的详细解析
+        per_video_limit = min(3500, max(600, 80000 // max(num_videos, 1)))
         
         videos_text = ""
         for i, v in enumerate(video_summaries, 1):
             videos_text += f"\n\n### 视频{i}：{v.get('title', '未知标题')}\n"
-            # 核心要点最多取3条，每条限制50字
-            kp = v.get('key_points', [])[:3]
-            videos_text += f"**核心要点**：{'; '.join(str(k)[:50] for k in kp)}\n"
-            # 内容摘要根据视频数量动态限制
-            videos_text += f"**内容摘要**：{v.get('summary', '')[:per_video_limit]}\n"
+            kp = v.get('key_points', [])[:8]
+            videos_text += f"**核心要点**：{'; '.join(str(k)[:80] for k in kp)}\n"
+            videos_text += f"**完整解析**：{v.get('summary', '')[:per_video_limit]}\n"
         
         system_prompt = f"""你是一个顶级的知识架构师和内容分析师。现在你需要分析抖音博主「{blogger_name}」的所有视频内容，为他构建一份完整、详尽的知识体系大文档。
 

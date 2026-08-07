@@ -38,6 +38,10 @@ class VideoResponse(BaseModel):
     topics: Optional[list] = None
     takeaways: Optional[str] = None
     transcript: Optional[str] = None
+    transcript_segments: Optional[list] = None
+    frame_notes: Optional[list] = None
+    knowledge_cards: Optional[list] = None
+    quality_report: Optional[dict] = None
     
     class Config:
         from_attributes = True
@@ -57,6 +61,8 @@ class BloggerResponse(BaseModel):
     total_videos: int = 0
     processed_videos: int = 0
     summarized_videos: int = 0
+    failed_videos: int = 0
+    pending_videos: int = 0
     current_video_index: int = 0
     progress: float = 0
     current_stage: str = ""
@@ -76,6 +82,26 @@ class BloggerDetailResponse(BloggerResponse):
     videos: List[VideoResponse] = []
 
 
+async def _attach_video_stats(db: AsyncSession, blogger: Blogger) -> Blogger:
+    """用真实视频状态回填成功/失败/待处理计数，避免前端长期看到假进度。"""
+    result = await db.execute(select(Video).where(Video.blogger_id == blogger.id))
+    videos = list(result.scalars().all())
+    summarized = sum(1 for v in videos if v.status == "summarized")
+    failed = sum(1 for v in videos if v.status == "failed")
+    pending = sum(
+        1
+        for v in videos
+        if v.status in {"pending", "downloading", "transcribing", "summarizing"}
+    )
+    blogger.summarized_videos = summarized
+    blogger.processed_videos = summarized
+    blogger.failed_videos = failed
+    blogger.pending_videos = pending
+    if not blogger.total_videos:
+        blogger.total_videos = len(videos)
+    return blogger
+
+
 @router.post("", response_model=BloggerResponse)
 async def add_blogger(
     req: AddBloggerRequest,
@@ -89,7 +115,7 @@ async def add_blogger(
             raise HTTPException(status_code=400, detail="无法获取博主信息，请检查链接是否正确")
         
         await db.refresh(blogger)
-        return blogger
+        return await _attach_video_stats(db, blogger)
         
     except HTTPException:
         raise
@@ -105,18 +131,10 @@ async def list_bloggers(db: AsyncSession = Depends(get_db)):
         select(Blogger).order_by(Blogger.created_at.desc())
     )
     bloggers = result.scalars().all()
-    
-    # 统计已总结视频数
+    out = []
     for b in bloggers:
-        vid_result = await db.execute(
-            select(Video).where(
-                Video.blogger_id == b.id,
-                Video.status == "summarized"
-            )
-        )
-        b.summarized_videos = len(vid_result.scalars().all())
-    
-    return bloggers
+        out.append(await _attach_video_stats(db, b))
+    return out
 
 
 @router.get("/{blogger_id}", response_model=BloggerDetailResponse)
@@ -132,10 +150,7 @@ async def get_blogger(blogger_id: int, db: AsyncSession = Depends(get_db)):
     if not blogger:
         raise HTTPException(status_code=404, detail="博主不存在")
     
-    # 统计已总结视频数
-    summarized = sum(1 for v in blogger.videos if v.status == "summarized")
-    blogger.summarized_videos = summarized
-    
+    await _attach_video_stats(db, blogger)
     return blogger
 
 
@@ -233,6 +248,23 @@ async def refresh_blogger(blogger_id: int, db: AsyncSession = Depends(get_db)):
     asyncio.create_task(orchestrator.process_blogger(db, blogger_id, source_url))
     
     return {"message": "已开始重新处理", "blogger_id": blogger_id}
+
+
+@router.post("/{blogger_id}/resume")
+async def resume_blogger(blogger_id: int, db: AsyncSession = Depends(get_db)):
+    """恢复未完成视频（不删除已成功结果）"""
+    result = await db.execute(select(Blogger).where(Blogger.id == blogger_id))
+    blogger = result.scalar_one_or_none()
+    if not blogger:
+        raise HTTPException(status_code=404, detail="博主不存在")
+
+    import asyncio
+    asyncio.create_task(orchestrator.resume_unfinished_videos(blogger_id))
+    return {
+        "message": "已开始恢复未完成视频",
+        "blogger_id": blogger_id,
+        "hint": "已成功视频会保留，仅重试未完成/失败项",
+    }
 
 
 @router.delete("/{blogger_id}")

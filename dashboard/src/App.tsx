@@ -20,6 +20,8 @@ import {
   Loader2,
   MessageSquare,
   BookOpen,
+  LogIn,
+  ShieldCheck,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -46,6 +48,8 @@ interface Blogger {
   total_videos: number
   processed_videos: number
   summarized_videos: number
+  failed_videos?: number
+  pending_videos?: number
   current_video_index: number
   progress: number
   current_stage: string
@@ -60,14 +64,37 @@ interface SystemStatus {
   asr_model: string
 }
 
+interface SystemConfig {
+  douyin_cookie_configured?: boolean
+  max_concurrent_videos?: number
+  max_videos_per_blogger?: number
+}
+
+interface DouyinLoginSession {
+  active: boolean
+  session_token?: string
+  viewer_url?: string
+  expires_in?: number
+  captured?: boolean
+  login_detected?: boolean
+  cookie_count?: number
+  cookie_names?: string[]
+  expired?: boolean
+}
+
 export default function App() {
   const [bloggers, setBloggers] = useState<Blogger[]>([])
   const [loading, setLoading] = useState(true)
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null)
+  const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null)
   const [shareUrl, setShareUrl] = useState('')
   const [adding, setAdding] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [selectedBlogger, setSelectedBlogger] = useState<Blogger | null>(null)
+  const [loginOpen, setLoginOpen] = useState(false)
+  const [loginStarting, setLoginStarting] = useState(false)
+  const [loginSession, setLoginSession] = useState<DouyinLoginSession | null>(null)
+  const [loginError, setLoginError] = useState('')
 
   const fetchBloggers = async () => {
     try {
@@ -91,10 +118,94 @@ export default function App() {
     }
   }
 
+  const fetchSystemConfig = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/system/config`)
+      const data = await res.json()
+      setSystemConfig(data)
+    } catch (e) {
+      console.error('Failed to fetch system config:', e)
+    }
+  }
+
   useEffect(() => {
     fetchBloggers()
     fetchSystemStatus()
+    fetchSystemConfig()
   }, [])
+
+  const startDouyinLogin = async () => {
+    setLoginOpen(true)
+    setLoginStarting(true)
+    setLoginError('')
+    try {
+      const res = await fetch(`${API_BASE}/api/system/douyin-login/start`, {
+        method: 'POST',
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || '登录窗口启动失败')
+      setLoginSession(data)
+    } catch (e: any) {
+      setLoginError(e.message || '登录窗口启动失败')
+      toast.error('登录窗口启动失败', { description: e.message })
+    } finally {
+      setLoginStarting(false)
+    }
+  }
+
+  const stopDouyinLogin = async () => {
+    const token = loginSession?.session_token
+    setLoginOpen(false)
+    setLoginSession(null)
+    setLoginError('')
+    if (!token) return
+    try {
+      await fetch(`${API_BASE}/api/system/douyin-login/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_token: token }),
+      })
+    } catch {
+      // 窗口到期/后端重启时无需打扰用户
+    }
+  }
+
+  useEffect(() => {
+    const token = loginSession?.session_token
+    if (!loginOpen || !token || loginSession?.captured) return
+
+    let cancelled = false
+    const check = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/system/douyin-login/status`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_token: token }),
+        })
+        const data = await res.json()
+        if (cancelled) return
+        if (!res.ok) throw new Error(data.detail || '登录状态检测失败')
+        setLoginSession(data)
+        if (data.captured) {
+          toast.success('抖音登录成功', {
+            description: 'Cookie 已永久保存到服务端，重启不会丢失。现在可刷新博主抓取全量。',
+          })
+          fetchSystemConfig()
+        } else if (data.expired) {
+          setLoginError('登录窗口已过期，请重新打开')
+        }
+      } catch (e: any) {
+        if (!cancelled) setLoginError(e.message || '登录状态检测失败')
+      }
+    }
+
+    check()
+    const interval = setInterval(check, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [loginOpen, loginSession?.session_token, loginSession?.captured])
 
   useEffect(() => {
     const processingStatuses = ['pending', 'crawling', 'downloading', 'transcribing', 'summarizing', 'processing']
@@ -151,6 +262,18 @@ export default function App() {
     }
   }
 
+  const handleResume = async (id: number) => {
+    try {
+      await fetch(`${API_BASE}/api/bloggers/${id}/resume`, { method: 'POST' })
+      toast.success('已开始恢复未完成视频', {
+        description: '已成功的视频会保留，只重试未完成项',
+      })
+      fetchBloggers()
+    } catch {
+      toast.error('恢复失败')
+    }
+  }
+
   const handleDelete = async (id: number) => {
     if (!confirm('确定删除该博主及其所有数据？')) return
     try {
@@ -185,9 +308,22 @@ export default function App() {
     return num.toString()
   }
 
+  const isCrawlTruncated = (blogger: Blogger) =>
+    blogger.aweme_count > 0 && blogger.total_videos > 0 && blogger.total_videos < blogger.aweme_count
+
+  const formatVideoCount = (blogger: Blogger) => {
+    if (blogger.aweme_count > 0) {
+      return `已抓 ${blogger.total_videos} / 作品 ${blogger.aweme_count}`
+    }
+    return `${blogger.total_videos} 视频`
+  }
+
   const totalBloggers = bloggers.length
-  const totalVideos = bloggers.reduce((sum, b) => sum + b.total_videos, 0)
-  const processedVideos = bloggers.reduce((sum, b) => sum + b.processed_videos, 0)
+  const totalVideos = bloggers.reduce((sum, b) => sum + (b.total_videos || 0), 0)
+  const processedVideos = bloggers.reduce(
+    (sum, b) => sum + (b.summarized_videos || b.processed_videos || 0),
+    0,
+  )
   const completionRate = totalVideos > 0 ? Math.round((processedVideos / totalVideos) * 100) : 0
 
   return (
@@ -221,12 +357,125 @@ export default function App() {
         </div>
       </header>
 
+      <Dialog
+        open={loginOpen}
+        onOpenChange={(open) => {
+          if (!open) stopDouyinLogin()
+          else setLoginOpen(true)
+        }}
+      >
+        <DialogContent className="flex h-[90vh] w-[96vw] max-w-[1180px] flex-col gap-0 overflow-hidden border border-[#E8E8E8] bg-white p-0 shadow-2xl">
+          <DialogHeader className="shrink-0 border-b border-[#F0F0F0] px-6 py-4">
+            <DialogTitle className="flex items-center gap-2 text-[16px] font-semibold text-[#1A1A1A]">
+              <LogIn size={17} className="text-[#2C5FFF]" />
+              登录抖音，自动获取 Cookie
+            </DialogTitle>
+            <DialogDescription className="flex items-center gap-2 text-[12px] text-[#777]">
+              <ShieldCheck size={13} className="text-[#16A34A]" />
+              这是服务器隔离浏览器。Cookie 只保存在服务端，不会显示或返回到前端。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="min-h-0 flex-1 bg-[#F5F5F5] p-3">
+            {loginStarting && (
+              <div className="flex h-full items-center justify-center text-[13px] text-[#666]">
+                <Loader2 size={18} className="mr-2 animate-spin text-[#2C5FFF]" />
+                正在启动隔离浏览器和安全隧道…
+              </div>
+            )}
+
+            {!loginStarting && loginError && (
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+                <AlertCircle size={30} className="text-[#DC2626]" />
+                <p className="max-w-xl text-[13px] text-[#DC2626]">{loginError}</p>
+                <Button onClick={startDouyinLogin} variant="outline">重新启动</Button>
+              </div>
+            )}
+
+            {!loginStarting && !loginError && loginSession?.viewer_url && (
+              <iframe
+                src={loginSession.viewer_url}
+                title="抖音隔离登录窗口"
+                className="h-full w-full rounded-lg border border-[#DDD] bg-black"
+                allow="clipboard-read; clipboard-write"
+              />
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center justify-between border-t border-[#F0F0F0] px-6 py-3">
+            <div className="text-[12px]">
+              {loginSession?.captured ? (
+                <span className="inline-flex items-center gap-1.5 font-medium text-[#16A34A]">
+                  <CheckCircle2 size={14} />
+                  登录成功，已安全保存 {loginSession.cookie_count || 0} 项 Cookie
+                </span>
+              ) : (
+                <span className="text-[#777]">
+                  请在窗口中扫码/登录；检测成功后会自动保存。
+                  {loginSession?.expires_in ? ` 窗口约 ${Math.ceil(loginSession.expires_in / 60)} 分钟后失效。` : ''}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {loginSession?.captured && (
+                <Button
+                  onClick={() => {
+                    stopDouyinLogin()
+                    fetchBloggers()
+                  }}
+                  className="bg-[#16A34A] hover:bg-[#15803D]"
+                >
+                  完成
+                </Button>
+              )}
+              <Button variant="outline" onClick={stopDouyinLogin}>
+                {loginSession?.captured ? '关闭窗口' : '取消'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {selectedBlogger ? (
         <KnowledgeDoc bloggerId={selectedBlogger.id} onBack={() => setSelectedBlogger(null)} />
       ) : (
         <>
       {/* 主内容 */}
       <main className="mx-auto max-w-[1280px] px-8 py-8">
+        {!systemConfig?.douyin_cookie_configured && (
+          <div className="mb-6 flex items-center justify-between gap-4 rounded-xl border border-[#FDE68A] bg-[#FFFBEB] px-4 py-3 text-[13px] text-[#92400E]">
+            <div>
+              <span className="font-medium">未配置 DOUYIN_COOKIE：</span>
+              抖音未登录时只能抓到部分最近作品。登录成功后会永久保存在服务端，重启不丢失。
+            </div>
+            <Button
+              size="sm"
+              onClick={startDouyinLogin}
+              className="shrink-0 gap-1.5 bg-[#D97706] text-white hover:bg-[#B45309]"
+            >
+              <LogIn size={14} />
+              登录抖音自动获取
+            </Button>
+          </div>
+        )}
+        {systemConfig?.douyin_cookie_configured && (
+          <div className="mb-6 flex items-center justify-between gap-4 rounded-xl border border-[#BBF7D0] bg-[#F0FDF4] px-4 py-3 text-[13px] text-[#166534]">
+            <div className="flex items-center gap-2">
+              <ShieldCheck size={15} />
+              <span>抖音 Cookie 已永久保存到服务端，重启后仍会自动加载。</span>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={startDouyinLogin}
+              className="shrink-0 gap-1.5 border-[#86EFAC] text-[#166534] hover:bg-[#DCFCE7]"
+            >
+              <LogIn size={14} />
+              重新登录
+            </Button>
+          </div>
+        )}
+
         {/* 页面标题区 */}
         <div className="mb-8 flex items-end justify-between">
           <div>
@@ -454,13 +703,36 @@ export default function App() {
                               {blogger.signature || '暂无简介'}
                             </p>
 
-                            <div className="mt-1.5 flex items-center gap-4 text-[11px] text-[#AAA]">
+                            <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#AAA]">
                               <span>{formatNumber(blogger.follower_count)} 粉丝</span>
                               <span className="text-[#DDD]">·</span>
-                              <span>{blogger.total_videos} 视频</span>
+                              <span className={isCrawlTruncated(blogger) ? 'font-medium text-[#D97706]' : ''}>
+                                {formatVideoCount(blogger)}
+                              </span>
                               <span className="text-[#DDD]">·</span>
-                              <span>{blogger.processed_videos} 已处理</span>
+                              <span className="text-[#16A34A]">
+                                成功 {blogger.summarized_videos || blogger.processed_videos || 0}
+                              </span>
+                              {(blogger.failed_videos || 0) > 0 && (
+                                <>
+                                  <span className="text-[#DDD]">·</span>
+                                  <span className="text-[#DC2626]">失败 {blogger.failed_videos}</span>
+                                </>
+                              )}
+                              {(blogger.pending_videos || 0) > 0 && (
+                                <>
+                                  <span className="text-[#DDD]">·</span>
+                                  <span className="text-[#2C5FFF]">处理中 {blogger.pending_videos}</span>
+                                </>
+                              )}
                             </div>
+
+                            {isCrawlTruncated(blogger) && (
+                              <p className="mt-1.5 text-[11px] leading-relaxed text-[#D97706]">
+                                未登录截断：仅抓到 {blogger.total_videos}/{blogger.aweme_count}。
+                                配置 DOUYIN_COOKIE 后刷新可抓全量。
+                              </p>
+                            )}
 
                             {/* 进度条 - 处理中时显示 */}
                             {['crawling', 'downloading', 'transcribing', 'summarizing', 'processing'].includes(blogger.status) && (
@@ -472,13 +744,12 @@ export default function App() {
                                   </span>
                                   <span className="shrink-0 text-[10px] font-medium text-[#2C5FFF]">
                                     {blogger.status === 'crawling' ? (
-                                      // 爬取阶段：显示已获取数量
-                                      blogger.total_videos > 0 
-                                        ? `已获取 ${blogger.total_videos} 个视频` 
+                                      blogger.total_videos > 0
+                                        ? `已获取 ${blogger.total_videos} 个视频`
                                         : '正在获取...'
                                     ) : blogger.total_videos > 0 ? (
-                                      // 处理阶段：显示 已处理/总数
-                                      `${blogger.current_video_index || blogger.processed_videos || 0}/${blogger.total_videos}`
+                                      `成功 ${blogger.summarized_videos || blogger.processed_videos || 0}/${blogger.total_videos}`
+                                      + ((blogger.pending_videos || 0) > 0 ? ` · 进行中 ${blogger.pending_videos}` : '')
                                     ) : (
                                       `${Math.round(blogger.progress)}%`
                                     )}
@@ -487,39 +758,69 @@ export default function App() {
                                 <div className="h-1.5 overflow-hidden rounded-full bg-[#EEF2FF]">
                                   <div
                                     className="h-full rounded-full bg-gradient-to-r from-[#2C5FFF] to-[#5B8DEF] transition-all duration-500 ease-out"
-                                    style={{ width: `${Math.max(blogger.progress, 2)}%` }}
+                                    style={{
+                                      width: `${Math.max(
+                                        blogger.total_videos > 0
+                                          ? ((blogger.summarized_videos || blogger.processed_videos || 0) / blogger.total_videos) * 100
+                                          : blogger.progress,
+                                        2,
+                                      )}%`,
+                                    }}
                                   />
                                 </div>
                               </div>
                             )}
 
-                            {/* 错误信息 */}
-                            {blogger.status === 'failed' && blogger.error_message && (
-                              <p className="mt-1.5 truncate text-[11px] text-[#DC2626]">
+                            {/* 错误 / 截断提示 */}
+                            {blogger.error_message && (
+                              <p className={`mt-1.5 truncate text-[11px] ${
+                                blogger.status === 'failed' ? 'text-[#DC2626]' : 'text-[#D97706]'
+                              }`}>
                                 {blogger.error_message}
                               </p>
                             )}
                           </div>
 
-                          {/* 操作按钮 */}
-                          <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                          {/* 操作按钮：常显删除，避免找不到 */}
+                          <div className="flex shrink-0 items-center gap-1">
+                            {(blogger.pending_videos || 0) > 0 || blogger.status === 'failed' ? (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-[#999] hover:text-[#16A34A] hover:bg-[#F0FDF4]"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleResume(blogger.id)
+                                }}
+                                title="恢复未完成视频"
+                              >
+                                <Play size={14} />
+                              </Button>
+                            ) : null}
                             <Button
                               variant="ghost"
                               size="icon"
                               className="h-8 w-8 text-[#999] hover:text-[#2C5FFF] hover:bg-[#F0F4FF]"
-                              onClick={() => handleRefresh(blogger.id)}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                handleRefresh(blogger.id)
+                              }}
                               title="重新处理"
                             >
                               <RefreshCw size={14} />
                             </Button>
                             <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 text-[#999] hover:text-[#DC2626] hover:bg-[#FEF2F2]"
-                              onClick={() => handleDelete(blogger.id)}
-                              title="删除"
+                              variant="outline"
+                              size="sm"
+                              className="h-8 gap-1 border-[#FECACA] px-2 text-[12px] text-[#DC2626] hover:bg-[#FEF2F2]"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                handleDelete(blogger.id)
+                              }}
+                              title="删除博主"
                             >
-                              <Trash2 size={14} />
+                              <Trash2 size={13} />
+                              删除
                             </Button>
                           </div>
                         </div>
