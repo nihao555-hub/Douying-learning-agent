@@ -83,17 +83,27 @@ class KnowledgeBaseService:
             return None
         collection_name = f"blogger_{blogger_id}"
         try:
-            collection = self.client.get_collection(
-                name=collection_name,
-                embedding_function=self.embedding_fn
-            )
-        except Exception:
-            collection = self.client.create_collection(
-                name=collection_name,
-                embedding_function=self.embedding_fn,
-                metadata={"blogger_id": blogger_id}
-            )
-        return collection
+            # chroma 新版本推荐 get_or_create，避免并发 create 冲突
+            if hasattr(self.client, "get_or_create_collection"):
+                return self.client.get_or_create_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_fn,
+                    metadata={"blogger_id": blogger_id},
+                )
+            try:
+                return self.client.get_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_fn,
+                )
+            except Exception:
+                return self.client.create_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_fn,
+                    metadata={"blogger_id": blogger_id},
+                )
+        except Exception as e:
+            logger.warning(f"获取 collection 失败: {e}")
+            return None
     
     async def add_video_document(
         self,
