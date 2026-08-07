@@ -195,14 +195,31 @@ class Orchestrator:
             
             logger.info(f"爬取到 {len(videos_info)} 个视频")
             expected = blogger.aweme_count or 0
+            cookie_configured = bool(getattr(settings, "DOUYIN_COOKIE", "") or "")
             if expected and len(videos_info) < expected:
-                logger.warning(
-                    f"爬取数量({len(videos_info)})少于博主作品数({expected})，"
-                    "可能因未登录 Cookie 被截断。请配置 DOUYIN_COOKIE。"
+                warn = (
+                    f"未登录截断：仅抓到 {len(videos_info)}/{expected}。"
+                    "抖音无 Cookie 时第2页起为空，无法全量；请配置 DOUYIN_COOKIE 后点刷新。"
                 )
+                logger.warning(warn)
+                blogger.error_message = warn
+            elif not cookie_configured and len(videos_info) > 0:
+                blogger.error_message = (
+                    "当前无 DOUYIN_COOKIE：只能抓到未登录可见的部分作品，全量需登录 Cookie。"
+                )
+            else:
+                blogger.error_message = None
             
             blogger.total_videos = len(videos_info)
-            blogger.current_stage = f"准备并发处理 {len(videos_info)} 个视频 (并发={self.max_concurrency})..."
+            stage_prefix = (
+                f"⚠️ 仅 {len(videos_info)}/{expected}（需Cookie全量）· "
+                if expected and len(videos_info) < expected
+                else ""
+            )
+            blogger.current_stage = (
+                f"{stage_prefix}准备并发处理 {len(videos_info)} 个视频 "
+                f"(并发={self.max_concurrency})..."
+            )
             blogger.progress = 20
             blogger.status = "downloading"
             await db.commit()

@@ -1123,6 +1123,19 @@ class DouyinClient:
                         has_more = response.get("has_more", 0)
                         resp_cursor = response.get("max_cursor", 0) or 0
                         
+                        # 未登录：首页已返回作品、下一页空列表 → 硬截断，立刻结束（避免 locate 空转几十秒）
+                        if (
+                            not aweme_list
+                            and all_videos
+                            and (login_limited or not has_login)
+                            and page_num >= 2
+                        ):
+                            logger.warning(
+                                f"未登录硬截断：第{page_num}页为空，已获取 {len(all_videos)} 个。"
+                                "配置 DOUYIN_COOKIE 后才能继续翻页至全量。"
+                            )
+                            break
+                        
                         if not aweme_list:
                             try:
                                 posts = UserPostFilter(response)
@@ -1299,8 +1312,8 @@ class DouyinClient:
         seen = {v.get("aweme_id") for v in seed_videos if v.get("aweme_id")}
         result = list(seed_videos)
         
-        # 取最多 8 个种子视频去发散，避免请求过多
-        seeds = seed_videos[:8]
+        # 未登录截断时尽量用更多种子发散（上限 40），提高同博主补充命中率
+        seeds = seed_videos[:40]
         
         def _sync_related():
             nonlocal result

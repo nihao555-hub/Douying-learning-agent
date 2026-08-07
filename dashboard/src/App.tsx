@@ -60,10 +60,17 @@ interface SystemStatus {
   asr_model: string
 }
 
+interface SystemConfig {
+  douyin_cookie_configured?: boolean
+  max_concurrent_videos?: number
+  max_videos_per_blogger?: number
+}
+
 export default function App() {
   const [bloggers, setBloggers] = useState<Blogger[]>([])
   const [loading, setLoading] = useState(true)
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null)
+  const [systemConfig, setSystemConfig] = useState<SystemConfig | null>(null)
   const [shareUrl, setShareUrl] = useState('')
   const [adding, setAdding] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -91,9 +98,20 @@ export default function App() {
     }
   }
 
+  const fetchSystemConfig = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/system/config`)
+      const data = await res.json()
+      setSystemConfig(data)
+    } catch (e) {
+      console.error('Failed to fetch system config:', e)
+    }
+  }
+
   useEffect(() => {
     fetchBloggers()
     fetchSystemStatus()
+    fetchSystemConfig()
   }, [])
 
   useEffect(() => {
@@ -185,6 +203,16 @@ export default function App() {
     return num.toString()
   }
 
+  const isCrawlTruncated = (blogger: Blogger) =>
+    blogger.aweme_count > 0 && blogger.total_videos > 0 && blogger.total_videos < blogger.aweme_count
+
+  const formatVideoCount = (blogger: Blogger) => {
+    if (blogger.aweme_count > 0) {
+      return `已抓 ${blogger.total_videos} / 作品 ${blogger.aweme_count}`
+    }
+    return `${blogger.total_videos} 视频`
+  }
+
   const totalBloggers = bloggers.length
   const totalVideos = bloggers.reduce((sum, b) => sum + b.total_videos, 0)
   const processedVideos = bloggers.reduce((sum, b) => sum + b.processed_videos, 0)
@@ -227,6 +255,14 @@ export default function App() {
         <>
       {/* 主内容 */}
       <main className="mx-auto max-w-[1280px] px-8 py-8">
+        {!systemConfig?.douyin_cookie_configured && (
+          <div className="mb-6 rounded-xl border border-[#FDE68A] bg-[#FFFBEB] px-4 py-3 text-[13px] text-[#92400E]">
+            <span className="font-medium">未配置 DOUYIN_COOKIE：</span>
+            抖音未登录时只能抓到部分最近作品（常见约 20–44 条，博主不同数量不同），无法翻页到全量。
+            配置登录 Cookie 后点博主右侧「刷新」可重新抓取。
+          </div>
+        )}
+
         {/* 页面标题区 */}
         <div className="mb-8 flex items-end justify-between">
           <div>
@@ -454,13 +490,22 @@ export default function App() {
                               {blogger.signature || '暂无简介'}
                             </p>
 
-                            <div className="mt-1.5 flex items-center gap-4 text-[11px] text-[#AAA]">
+                            <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#AAA]">
                               <span>{formatNumber(blogger.follower_count)} 粉丝</span>
                               <span className="text-[#DDD]">·</span>
-                              <span>{blogger.total_videos} 视频</span>
+                              <span className={isCrawlTruncated(blogger) ? 'font-medium text-[#D97706]' : ''}>
+                                {formatVideoCount(blogger)}
+                              </span>
                               <span className="text-[#DDD]">·</span>
                               <span>{blogger.processed_videos} 已处理</span>
                             </div>
+
+                            {isCrawlTruncated(blogger) && (
+                              <p className="mt-1.5 text-[11px] leading-relaxed text-[#D97706]">
+                                未登录截断：仅抓到 {blogger.total_videos}/{blogger.aweme_count}。
+                                配置 DOUYIN_COOKIE 后刷新可抓全量。
+                              </p>
+                            )}
 
                             {/* 进度条 - 处理中时显示 */}
                             {['crawling', 'downloading', 'transcribing', 'summarizing', 'processing'].includes(blogger.status) && (
@@ -493,9 +538,11 @@ export default function App() {
                               </div>
                             )}
 
-                            {/* 错误信息 */}
-                            {blogger.status === 'failed' && blogger.error_message && (
-                              <p className="mt-1.5 truncate text-[11px] text-[#DC2626]">
+                            {/* 错误 / 截断提示 */}
+                            {blogger.error_message && (
+                              <p className={`mt-1.5 truncate text-[11px] ${
+                                blogger.status === 'failed' ? 'text-[#DC2626]' : 'text-[#D97706]'
+                              }`}>
                                 {blogger.error_message}
                               </p>
                             )}
