@@ -52,6 +52,12 @@ async def startup():
     logger.info("编排服务启动中...")
     await init_db()
     logger.info("数据库初始化完成")
+    # 永久 Cookie：从 data/secrets 加载，重启不丢失
+    try:
+        from app.services.cookie_store import bootstrap_cookie_on_startup
+        bootstrap_cookie_on_startup()
+    except Exception as e:
+        logger.warning(f"加载永久 Cookie 失败: {e}")
     logger.info(f"ASR 引擎: {settings.ASR_ENGINE} ({settings.WHISPER_MODEL_SIZE})")
     if DASHBOARD_DIST.exists():
         logger.info(f"前端静态资源: {DASHBOARD_DIST}")

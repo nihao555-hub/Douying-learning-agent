@@ -66,19 +66,22 @@ async def system_status():
 @router.get("/config")
 async def get_config():
     """获取当前配置（严格脱敏：绝不返回任何密钥/Cookie）"""
+    from app.services.cookie_store import load_persisted_cookie
+
+    cookie = (getattr(settings, "DOUYIN_COOKIE", "") or "").strip() or load_persisted_cookie()
     return {
         "douyin_api_url": settings.DOUYIN_API_BASE_URL,
         "dify_api_url": settings.DIFY_API_BASE_URL,
         "dify_configured": bool(settings.DIFY_API_KEY and settings.DIFY_DATASET_ID),
         "gemini_configured": bool(settings.GEMINI_API_KEY),
         "gemini_model": settings.GEMINI_MODEL,
-        "douyin_cookie_configured": bool(getattr(settings, "DOUYIN_COOKIE", "")),
+        "douyin_cookie_configured": bool(cookie),
         "asr_engine": settings.ASR_ENGINE,
         "whisper_model": settings.WHISPER_MODEL_SIZE,
         "whisper_device": settings.WHISPER_DEVICE,
         "max_videos_per_blogger": settings.MAX_VIDEOS_PER_BLOGGER,
         "max_concurrent_videos": getattr(settings, "MAX_CONCURRENT_VIDEOS", 1000),
-        "max_pipeline_workers": getattr(settings, "MAX_PIPELINE_WORKERS", 20),
+        "max_pipeline_workers": getattr(settings, "MAX_PIPELINE_WORKERS", 4),
         "video_slice_seconds": getattr(settings, "VIDEO_SLICE_SECONDS", 120),
         "full_video_pipeline": True,
         "no_frame_extraction": True,

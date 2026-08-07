@@ -188,7 +188,7 @@ export default function App() {
         setLoginSession(data)
         if (data.captured) {
           toast.success('抖音登录成功', {
-            description: 'Cookie 已安全保存到服务端，现在可以刷新博主抓取全量视频。',
+            description: 'Cookie 已永久保存到服务端，重启不会丢失。现在可刷新博主抓取全量。',
           })
           fetchSystemConfig()
         } else if (data.expired) {
@@ -446,7 +446,7 @@ export default function App() {
           <div className="mb-6 flex items-center justify-between gap-4 rounded-xl border border-[#FDE68A] bg-[#FFFBEB] px-4 py-3 text-[13px] text-[#92400E]">
             <div>
               <span className="font-medium">未配置 DOUYIN_COOKIE：</span>
-              抖音未登录时只能抓到部分最近作品（常见约 20–44 条），无法翻页到全量。
+              抖音未登录时只能抓到部分最近作品。登录成功后会永久保存在服务端，重启不丢失。
             </div>
             <Button
               size="sm"
@@ -455,6 +455,23 @@ export default function App() {
             >
               <LogIn size={14} />
               登录抖音自动获取
+            </Button>
+          </div>
+        )}
+        {systemConfig?.douyin_cookie_configured && (
+          <div className="mb-6 flex items-center justify-between gap-4 rounded-xl border border-[#BBF7D0] bg-[#F0FDF4] px-4 py-3 text-[13px] text-[#166534]">
+            <div className="flex items-center gap-2">
+              <ShieldCheck size={15} />
+              <span>抖音 Cookie 已永久保存到服务端，重启后仍会自动加载。</span>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={startDouyinLogin}
+              className="shrink-0 gap-1.5 border-[#86EFAC] text-[#166534] hover:bg-[#DCFCE7]"
+            >
+              <LogIn size={14} />
+              重新登录
             </Button>
           </div>
         )}
@@ -764,14 +781,17 @@ export default function App() {
                             )}
                           </div>
 
-                          {/* 操作按钮 */}
-                          <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                          {/* 操作按钮：常显删除，避免找不到 */}
+                          <div className="flex shrink-0 items-center gap-1">
                             {(blogger.pending_videos || 0) > 0 || blogger.status === 'failed' ? (
                               <Button
                                 variant="ghost"
                                 size="icon"
                                 className="h-8 w-8 text-[#999] hover:text-[#16A34A] hover:bg-[#F0FDF4]"
-                                onClick={() => handleResume(blogger.id)}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleResume(blogger.id)
+                                }}
                                 title="恢复未完成视频"
                               >
                                 <Play size={14} />
@@ -781,19 +801,26 @@ export default function App() {
                               variant="ghost"
                               size="icon"
                               className="h-8 w-8 text-[#999] hover:text-[#2C5FFF] hover:bg-[#F0F4FF]"
-                              onClick={() => handleRefresh(blogger.id)}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                handleRefresh(blogger.id)
+                              }}
                               title="重新处理"
                             >
                               <RefreshCw size={14} />
                             </Button>
                             <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8 text-[#999] hover:text-[#DC2626] hover:bg-[#FEF2F2]"
-                              onClick={() => handleDelete(blogger.id)}
-                              title="删除"
+                              variant="outline"
+                              size="sm"
+                              className="h-8 gap-1 border-[#FECACA] px-2 text-[12px] text-[#DC2626] hover:bg-[#FEF2F2]"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                handleDelete(blogger.id)
+                              }}
+                              title="删除博主"
                             >
-                              <Trash2 size={14} />
+                              <Trash2 size={13} />
+                              删除
                             </Button>
                           </div>
                         </div>

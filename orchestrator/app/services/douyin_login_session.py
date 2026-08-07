@@ -295,32 +295,9 @@ class DouyinLoginSession:
 
     @staticmethod
     def _persist_cookie(header: str):
-        env_path = Path(__file__).resolve().parents[2] / ".env"
-        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-        escaped = header.replace("\\", "\\\\").replace("'", "\\'")
-        replacement = f"DOUYIN_COOKIE='{escaped}'"
-        output = []
-        replaced = False
-        for line in lines:
-            if line.startswith("DOUYIN_COOKIE="):
-                output.append(replacement)
-                replaced = True
-            else:
-                output.append(line)
-        if not replaced:
-            output.append(replacement)
-        temp = env_path.with_suffix(".env.tmp")
-        temp.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
-        temp.chmod(0o600)
-        temp.replace(env_path)
+        from app.services.cookie_store import persist_douyin_cookie
 
-        # 当前进程立即生效，无需重启。
-        settings.DOUYIN_COOKIE = header
-        from app.services.douyin_client import get_douyin_client
-        client = get_douyin_client()
-        client.cookie = header
-        client._enhanced_cookie_header = None
-        client._base_cookies = None
+        persist_douyin_cookie(header, require_login_keys=True)
 
     async def status(self, session_token: str) -> Dict:
         if not self.token or not secrets.compare_digest(session_token or "", self.token):
