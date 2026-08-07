@@ -3,16 +3,22 @@
 """
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.services.douyin_client import get_douyin_client
+from app.services.douyin_login_session import get_douyin_login_session
 from app.services.dify_client import get_dify_client
 from app.services.quality_audit import run_quality_audit
 from app.core.config import settings
 from pathlib import Path
 
 router = APIRouter(prefix="/api/system", tags=["系统状态"])
+
+
+class DouyinLoginStatusRequest(BaseModel):
+    session_token: str
 
 
 @router.get("/health")
@@ -76,6 +82,39 @@ async def get_config():
         "full_video_pipeline": True,
         "no_frame_extraction": True,
     }
+
+
+@router.post("/douyin-login/start")
+async def start_douyin_login():
+    """
+    启动隔离的抖音登录浏览器。
+    登录窗口 10 分钟后失效；Cookie 明文永不返回前端。
+    """
+    try:
+        return await get_douyin_login_session().start()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"登录窗口启动失败: {str(exc)[:300]}")
+
+
+@router.post("/douyin-login/status")
+async def douyin_login_status(req: DouyinLoginStatusRequest):
+    """检测登录并在服务端自动捕获 Cookie（响应仅含脱敏状态）。"""
+    try:
+        return await get_douyin_login_session().status(req.session_token)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"登录状态检测失败: {str(exc)[:300]}")
+
+
+@router.post("/douyin-login/stop")
+async def stop_douyin_login(req: DouyinLoginStatusRequest):
+    """关闭当前登录窗口。"""
+    session = get_douyin_login_session()
+    if not session.token or req.session_token != session.token:
+        raise HTTPException(status_code=403, detail="登录会话无效")
+    await session.stop()
+    return {"stopped": True}
 
 
 @router.get("/quality-audit")

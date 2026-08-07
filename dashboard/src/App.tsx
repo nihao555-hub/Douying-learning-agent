@@ -20,6 +20,8 @@ import {
   Loader2,
   MessageSquare,
   BookOpen,
+  LogIn,
+  ShieldCheck,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -66,6 +68,18 @@ interface SystemConfig {
   max_videos_per_blogger?: number
 }
 
+interface DouyinLoginSession {
+  active: boolean
+  session_token?: string
+  viewer_url?: string
+  expires_in?: number
+  captured?: boolean
+  login_detected?: boolean
+  cookie_count?: number
+  cookie_names?: string[]
+  expired?: boolean
+}
+
 export default function App() {
   const [bloggers, setBloggers] = useState<Blogger[]>([])
   const [loading, setLoading] = useState(true)
@@ -75,6 +89,10 @@ export default function App() {
   const [adding, setAdding] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [selectedBlogger, setSelectedBlogger] = useState<Blogger | null>(null)
+  const [loginOpen, setLoginOpen] = useState(false)
+  const [loginStarting, setLoginStarting] = useState(false)
+  const [loginSession, setLoginSession] = useState<DouyinLoginSession | null>(null)
+  const [loginError, setLoginError] = useState('')
 
   const fetchBloggers = async () => {
     try {
@@ -113,6 +131,79 @@ export default function App() {
     fetchSystemStatus()
     fetchSystemConfig()
   }, [])
+
+  const startDouyinLogin = async () => {
+    setLoginOpen(true)
+    setLoginStarting(true)
+    setLoginError('')
+    try {
+      const res = await fetch(`${API_BASE}/api/system/douyin-login/start`, {
+        method: 'POST',
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || '登录窗口启动失败')
+      setLoginSession(data)
+    } catch (e: any) {
+      setLoginError(e.message || '登录窗口启动失败')
+      toast.error('登录窗口启动失败', { description: e.message })
+    } finally {
+      setLoginStarting(false)
+    }
+  }
+
+  const stopDouyinLogin = async () => {
+    const token = loginSession?.session_token
+    setLoginOpen(false)
+    setLoginSession(null)
+    setLoginError('')
+    if (!token) return
+    try {
+      await fetch(`${API_BASE}/api/system/douyin-login/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_token: token }),
+      })
+    } catch {
+      // 窗口到期/后端重启时无需打扰用户
+    }
+  }
+
+  useEffect(() => {
+    const token = loginSession?.session_token
+    if (!loginOpen || !token || loginSession?.captured) return
+
+    let cancelled = false
+    const check = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/system/douyin-login/status`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_token: token }),
+        })
+        const data = await res.json()
+        if (cancelled) return
+        if (!res.ok) throw new Error(data.detail || '登录状态检测失败')
+        setLoginSession(data)
+        if (data.captured) {
+          toast.success('抖音登录成功', {
+            description: 'Cookie 已安全保存到服务端，现在可以刷新博主抓取全量视频。',
+          })
+          fetchSystemConfig()
+        } else if (data.expired) {
+          setLoginError('登录窗口已过期，请重新打开')
+        }
+      } catch (e: any) {
+        if (!cancelled) setLoginError(e.message || '登录状态检测失败')
+      }
+    }
+
+    check()
+    const interval = setInterval(check, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [loginOpen, loginSession?.session_token, loginSession?.captured])
 
   useEffect(() => {
     const processingStatuses = ['pending', 'crawling', 'downloading', 'transcribing', 'summarizing', 'processing']
@@ -249,6 +340,85 @@ export default function App() {
         </div>
       </header>
 
+      <Dialog
+        open={loginOpen}
+        onOpenChange={(open) => {
+          if (!open) stopDouyinLogin()
+          else setLoginOpen(true)
+        }}
+      >
+        <DialogContent className="flex h-[90vh] w-[96vw] max-w-[1180px] flex-col gap-0 overflow-hidden border border-[#E8E8E8] bg-white p-0 shadow-2xl">
+          <DialogHeader className="shrink-0 border-b border-[#F0F0F0] px-6 py-4">
+            <DialogTitle className="flex items-center gap-2 text-[16px] font-semibold text-[#1A1A1A]">
+              <LogIn size={17} className="text-[#2C5FFF]" />
+              登录抖音，自动获取 Cookie
+            </DialogTitle>
+            <DialogDescription className="flex items-center gap-2 text-[12px] text-[#777]">
+              <ShieldCheck size={13} className="text-[#16A34A]" />
+              这是服务器隔离浏览器。Cookie 只保存在服务端，不会显示或返回到前端。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="min-h-0 flex-1 bg-[#F5F5F5] p-3">
+            {loginStarting && (
+              <div className="flex h-full items-center justify-center text-[13px] text-[#666]">
+                <Loader2 size={18} className="mr-2 animate-spin text-[#2C5FFF]" />
+                正在启动隔离浏览器和安全隧道…
+              </div>
+            )}
+
+            {!loginStarting && loginError && (
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+                <AlertCircle size={30} className="text-[#DC2626]" />
+                <p className="max-w-xl text-[13px] text-[#DC2626]">{loginError}</p>
+                <Button onClick={startDouyinLogin} variant="outline">重新启动</Button>
+              </div>
+            )}
+
+            {!loginStarting && !loginError && loginSession?.viewer_url && (
+              <iframe
+                src={loginSession.viewer_url}
+                title="抖音隔离登录窗口"
+                className="h-full w-full rounded-lg border border-[#DDD] bg-black"
+                allow="clipboard-read; clipboard-write"
+              />
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center justify-between border-t border-[#F0F0F0] px-6 py-3">
+            <div className="text-[12px]">
+              {loginSession?.captured ? (
+                <span className="inline-flex items-center gap-1.5 font-medium text-[#16A34A]">
+                  <CheckCircle2 size={14} />
+                  登录成功，已安全保存 {loginSession.cookie_count || 0} 项 Cookie
+                </span>
+              ) : (
+                <span className="text-[#777]">
+                  请在窗口中扫码/登录；检测成功后会自动保存。
+                  {loginSession?.expires_in ? ` 窗口约 ${Math.ceil(loginSession.expires_in / 60)} 分钟后失效。` : ''}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {loginSession?.captured && (
+                <Button
+                  onClick={() => {
+                    stopDouyinLogin()
+                    fetchBloggers()
+                  }}
+                  className="bg-[#16A34A] hover:bg-[#15803D]"
+                >
+                  完成
+                </Button>
+              )}
+              <Button variant="outline" onClick={stopDouyinLogin}>
+                {loginSession?.captured ? '关闭窗口' : '取消'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {selectedBlogger ? (
         <KnowledgeDoc bloggerId={selectedBlogger.id} onBack={() => setSelectedBlogger(null)} />
       ) : (
@@ -256,10 +426,19 @@ export default function App() {
       {/* 主内容 */}
       <main className="mx-auto max-w-[1280px] px-8 py-8">
         {!systemConfig?.douyin_cookie_configured && (
-          <div className="mb-6 rounded-xl border border-[#FDE68A] bg-[#FFFBEB] px-4 py-3 text-[13px] text-[#92400E]">
-            <span className="font-medium">未配置 DOUYIN_COOKIE：</span>
-            抖音未登录时只能抓到部分最近作品（常见约 20–44 条，博主不同数量不同），无法翻页到全量。
-            配置登录 Cookie 后点博主右侧「刷新」可重新抓取。
+          <div className="mb-6 flex items-center justify-between gap-4 rounded-xl border border-[#FDE68A] bg-[#FFFBEB] px-4 py-3 text-[13px] text-[#92400E]">
+            <div>
+              <span className="font-medium">未配置 DOUYIN_COOKIE：</span>
+              抖音未登录时只能抓到部分最近作品（常见约 20–44 条），无法翻页到全量。
+            </div>
+            <Button
+              size="sm"
+              onClick={startDouyinLogin}
+              className="shrink-0 gap-1.5 bg-[#D97706] text-white hover:bg-[#B45309]"
+            >
+              <LogIn size={14} />
+              登录抖音自动获取
+            </Button>
           </div>
         )}
 
