@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import secrets
 import shutil
 import signal
@@ -42,7 +41,6 @@ class DouyinLoginSession:
     def __init__(self):
         self.token: Optional[str] = None
         self.vnc_password: Optional[str] = None
-        self.public_url: Optional[str] = None
         self.created_at: float = 0
         self.processes: List[subprocess.Popen] = []
         self._lock = asyncio.Lock()
@@ -54,13 +52,12 @@ class DouyinLoginSession:
     def active(self) -> bool:
         return bool(
             self.token
-            and self.public_url
             and time.time() - self.created_at < self.SESSION_TTL
             and any(p.poll() is None for p in self.processes)
         )
 
     def _check_dependencies(self):
-        required = ["Xtigervnc", "vncpasswd", "google-chrome", "websockify", "cloudflared"]
+        required = ["Xtigervnc", "vncpasswd", "google-chrome", "websockify"]
         missing = [name for name in required if not shutil.which(name)]
         if missing:
             raise RuntimeError(f"登录窗口依赖缺失: {', '.join(missing)}")
@@ -99,7 +96,6 @@ class DouyinLoginSession:
         self.processes = []
         self.token = None
         self.vnc_password = None
-        self.public_url = None
         self.created_at = 0
         self._captured = False
         self._cookie_count = 0
@@ -196,7 +192,6 @@ class DouyinLoginSession:
             self._popen(
                 [
                     "websockify",
-                    "--web", str(self.NOVNC_ROOT),
                     str(self.NOVNC_PORT),
                     f"localhost:{self.VNC_PORT}",
                 ],
@@ -204,49 +199,19 @@ class DouyinLoginSession:
                 stderr=subprocess.STDOUT,
             )
 
-            tunnel = self._popen(
-                [
-                    "cloudflared", "tunnel",
-                    "--no-autoupdate",
-                    "--url", f"http://127.0.0.1:{self.NOVNC_PORT}",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            deadline = time.time() + 25
-            url_pattern = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-            lines = []
-            while time.time() < deadline:
-                line = await asyncio.to_thread(tunnel.stdout.readline)
-                if not line:
-                    if tunnel.poll() is not None:
-                        break
-                    await asyncio.sleep(0.1)
-                    continue
-                lines.append(line.strip())
-                match = url_pattern.search(line)
-                if match:
-                    self.public_url = match.group(0)
-                    break
-
-            if not self.public_url:
-                await self.stop()
-                raise RuntimeError(
-                    "登录窗口公网隧道启动失败: " + " | ".join(lines[-3:])
-                )
-
             logger.info("抖音隔离登录窗口已启动（Cookie 不会返回前端）")
             return self._public_state()
 
     def _public_state(self) -> Dict:
         expires_in = max(0, int(self.SESSION_TTL - (time.time() - self.created_at)))
         viewer_url = None
-        if self.public_url and self.vnc_password:
+        if self.vnc_password:
+            # 与主站同源：FastAPI 提供 noVNC 静态文件并代理 WebSocket，
+            # 避免临时 Quick Tunnel 的 DNS 延迟/失效。
             viewer_url = (
-                f"{self.public_url}/vnc.html"
+                "/novnc/vnc.html"
                 f"?autoconnect=true&resize=scale&quality=6"
+                f"&path=novnc/websockify"
                 f"&password={quote(self.vnc_password)}"
             )
         return {
@@ -289,6 +254,44 @@ class DouyinLoginSession:
             ):
                 allowed[name] = value
         return "; ".join(f"{k}={v}" for k, v in allowed.items())
+
+    @staticmethod
+    async def _validate_logged_in(header: str) -> bool:
+        """
+        不能只看 sessionid 等键：抖音现在会给匿名访客下发同名会话键。
+        以 self profile API 的 status_code=0 且存在用户标识为准。
+        """
+        if not header:
+            return False
+        try:
+            async with httpx.AsyncClient(
+                timeout=12,
+                follow_redirects=True,
+                verify=False,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": "https://www.douyin.com/",
+                    "Cookie": header,
+                },
+            ) as client:
+                response = await client.get(
+                    "https://www.douyin.com/aweme/v1/web/user/profile/self/"
+                )
+                data = response.json()
+            user = data.get("user") or {}
+            user_id = (
+                user.get("uid")
+                or user.get("short_id")
+                or user.get("sec_uid")
+                or user.get("sec_user_id")
+            )
+            return data.get("status_code") == 0 and bool(user_id)
+        except Exception as exc:
+            logger.debug(f"验证抖音登录态失败: {exc}")
+            return False
 
     @staticmethod
     def _persist_cookie(header: str):
@@ -334,8 +337,7 @@ class DouyinLoginSession:
 
         header = self._cookie_header(cookies)
         names = [part.split("=", 1)[0] for part in header.split("; ") if "=" in part]
-        login_keys = {"sessionid", "sessionid_ss", "sid_tt", "uid_tt", "sid_guard"}
-        has_login = bool(login_keys.intersection({n.lower() for n in names}))
+        has_login = await self._validate_logged_in(header)
 
         self._cookie_count = len(names)
         # 仅公开名称，不返回值。
@@ -347,6 +349,7 @@ class DouyinLoginSession:
 
         state = self._public_state()
         state["login_detected"] = has_login
+        state["validation"] = "已验证账号登录态" if has_login else "等待用户登录"
         return state
 
 

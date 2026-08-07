@@ -3,11 +3,13 @@
 同时托管 dashboard 前端静态资源，便于通过同一公网隧道访问。
 """
 from pathlib import Path
+import asyncio
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+import websockets
 
 from app.core.config import settings
 from app.core.database import init_db
@@ -22,6 +24,7 @@ os.makedirs(settings.TRANSCRIPT_STORAGE_PATH, exist_ok=True)
 os.makedirs(settings.KB_STORAGE_PATH, exist_ok=True)
 
 DASHBOARD_DIST = Path(__file__).resolve().parents[1] / "dashboard" / "dist"
+NOVNC_ROOT = Path("/usr/local/novnc/noVNC-1.2.0")
 
 app = FastAPI(
     title="抖音博主学习 Agent - 编排服务",
@@ -75,6 +78,62 @@ if (DASHBOARD_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(DASHBOARD_DIST / "assets")), name="assets")
 
 
+@app.websocket("/novnc/websockify")
+async def novnc_websocket_proxy(websocket: WebSocket):
+    """把同源 noVNC WebSocket 代理到隔离登录窗口，避免额外公网隧道。"""
+    requested = websocket.headers.get("sec-websocket-protocol", "")
+    protocols = [p.strip() for p in requested.split(",") if p.strip()]
+    selected = "binary" if "binary" in protocols else (protocols[0] if protocols else None)
+    await websocket.accept(subprotocol=selected)
+
+    try:
+        async with websockets.connect(
+            "ws://127.0.0.1:26059",
+            subprotocols=["binary"],
+            max_size=None,
+            open_timeout=5,
+        ) as upstream:
+            async def client_to_upstream():
+                while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    payload = message.get("bytes")
+                    if payload is None:
+                        payload = message.get("text")
+                    if payload is not None:
+                        await upstream.send(payload)
+
+            async def upstream_to_client():
+                async for payload in upstream:
+                    if isinstance(payload, bytes):
+                        await websocket.send_bytes(payload)
+                    else:
+                        await websocket.send_text(payload)
+
+            tasks = [
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+            ]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                try:
+                    task.result()
+                except (WebSocketDisconnect, RuntimeError):
+                    pass
+    except (OSError, WebSocketDisconnect):
+        try:
+            await websocket.close(code=1011)
+        except RuntimeError:
+            pass
+
+
+if NOVNC_ROOT.exists():
+    app.mount("/novnc", StaticFiles(directory=str(NOVNC_ROOT)), name="novnc")
+
+
 @app.get("/")
 async def spa_index():
     index = DASHBOARD_DIST / "index.html"
@@ -110,7 +169,7 @@ async def icons():
 @app.get("/{full_path:path}")
 async def spa_fallback(full_path: str):
     """SPA 路由回退；不拦截 API/文档。"""
-    blocked_prefixes = ("api/", "docs", "openapi.json", "redoc", "assets/")
+    blocked_prefixes = ("api/", "docs", "openapi.json", "redoc", "assets/", "novnc/")
     if full_path.startswith(blocked_prefixes) or full_path in {
         "docs",
         "openapi.json",
